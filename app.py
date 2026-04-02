@@ -54,27 +54,24 @@ else:
     REPORTLAB_ERROR = "reportlab non installé"
 
 try:
-    from pptx import Presentation
-    from pptx.util import Inches, Pt, Emu
-    from pptx.dml.color import RGBColor
-    from pptx.enum.text import PP_ALIGN
-    import pptx.util as pptx_util
-    PPTX_AVAILABLE = True
-    PPTX_ERROR = ""
-except ImportError as e:
-    Presentation = None
-    RGBColor = None
-    PP_ALIGN = None
-    PPTX_AVAILABLE = False
-    PPTX_ERROR = str(e)
+    import mstarpy
+    MSTARPY_AVAILABLE = True
+except ImportError:
+    mstarpy = None  # type: ignore[assignment]
+    MSTARPY_AVAILABLE = False
 
+try:
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    go = None  # type: ignore[assignment]
+    PLOTLY_AVAILABLE = False
 
 # ------------------------------------------------------------
 # Constantes & univers de fonds recommandés
 # ------------------------------------------------------------
 TODAY = pd.Timestamp.today().normalize()
-APP_TITLE = "Analyse Patrimoniale"
-APP_SUBTITLE = "Outil de conseil en gestion de patrimoine"
+APP_TITLE = "Comparateur de portefeuilles"
 ANNUAL_FEE_EURO_PCT = 0.9
 ANNUAL_FEE_UC_PCT = 1.2
 RISK_FREE_RATE_FALLBACK = 0.026  # 2.6 % — valeur de repli si API Bund indisponible
@@ -224,16 +221,13 @@ def _get_api_key() -> str:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def eodhd_get(path: str, params: Dict[str, Any] | None = None) -> Any:
-    # IMPORTANT : ne jamais appeler st.* (spinner, warning, etc.)
-    # dans une fonction @st.cache_data — Streamlit intercepte ces appels
-    # lors du replay du cache au premier rendu et lève une exception
-    # silencieuse qui vide le résultat.
     base = "https://eodhd.com/api"
     token = _get_api_key()
     p = {"api_token": token, "fmt": "json"}
     if params:
         p.update(params)
-    r = requests.get(f"{base}{path}", params=p, timeout=20)
+    with st.spinner("Chargement EODHD..."):
+        r = requests.get(f"{base}{path}", params=p, timeout=20)
     r.raise_for_status()
     try:
         return r.json()
@@ -474,10 +468,39 @@ def _compute_auto_euro_rate(
     return round(float(filtered["taux_net_publie_pct"].mean()), 2)
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
 @st.cache_data(show_spinner=False, ttl=86400)
 def _mstarpy_nav_series(isin: str) -> pd.DataFrame:
-    """Fallback mstarpy désactivé — retourne toujours un DataFrame vide."""
-    return pd.DataFrame()
+    """
+    Tente de récupérer l'historique VL via mstarpy (fallback EODHD).
+    Retourne un DataFrame avec colonne 'Close' indexé par DatetimeIndex.
+    Retourne pd.DataFrame() si échec ou mstarpy non disponible.
+    TTL 24h — la VL est publiée quotidiennement.
+    """
+    if not MSTARPY_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        fund = mstarpy.Funds(term=isin, pageSize=1)
+        if not fund.isin:
+            return pd.DataFrame()
+        nav_data = fund.nav(start_date="2005-01-01", frequency="daily")
+        if not nav_data:
+            return pd.DataFrame()
+        df = pd.DataFrame(nav_data)
+        if "date" not in df.columns or df.empty:
+            return pd.DataFrame()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.set_index("date")
+        # mstarpy retourne "nav" ou "close" selon la version
+        nav_col = next((c for c in df.columns if c.lower() in ("nav", "close")), None)
+        if nav_col is None:
+            return pd.DataFrame()
+        df = df.rename(columns={nav_col: "Close"})
+        df["Close"] = pd.to_numeric(df["Close"], errors="coerce")
+        return df[["Close"]].dropna().sort_index()
+    except Exception:
+        return pd.DataFrame()
 
 
 def get_price_series(
@@ -1215,9 +1238,9 @@ def _line_card(line: Dict[str, Any], idx: int, port_key: str):
                 with c1:
                     new_amount = st.text_input("Montant investi (brut) €", value=str(line.get("amount_gross", "")))
                 with c2:
-                    new_date = st.date_input("Date d'achat", value=pd.Timestamp(line.get("buy_date")).date())
+                    new_date = st.date_input("Date d’achat", value=pd.Timestamp(line.get("buy_date")).date())
                 with c3:
-                    new_px = st.text_input("Prix d'achat (optionnel)", value=str(line.get("buy_px", "")))
+                    new_px = st.text_input("Prix d’achat (optionnel)", value=str(line.get("buy_px", "")))
                 with c4:
                     st.caption(" ")
                     submitted = st.form_submit_button("💾 Enregistrer")
@@ -1639,236 +1662,39 @@ def portfolio_risk_stats(
     }
 
 
-def compute_diversification_score(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-) -> Optional[Dict[str, Any]]:
-    """
-    Score de diversification 0–100 basé sur la corrélation moyenne hors-diagonale.
-    0 = tout corrélé (fausse diversification), 100 = parfaitement décorrélé.
-    Retourne aussi les paires fortement corrélées (doublons) et en vigilance.
-    """
-    corr = correlation_matrix_from_lines(lines, euro_rate)
-    if corr.empty or corr.shape[0] < 2:
-        return None
-
-    avg_corr = _avg_offdiag_corr(corr)
-    score = max(0.0, min(100.0, (1.0 - avg_corr) * 100.0))
-
-    doublons: List[tuple] = []   # > 0.90 : quasi-identiques
-    vigilance: List[tuple] = []  # > 0.80 : diversification limitée
-    cols = list(corr.columns)
-    for i in range(len(cols)):
-        for j in range(i + 1, len(cols)):
-            c = float(corr.iloc[i, j])
-            name_i = cols[i].split(" (")[0][:30]
-            name_j = cols[j].split(" (")[0][:30]
-            if c > 0.90:
-                doublons.append((name_i, name_j, c))
-            elif c > 0.80:
-                vigilance.append((name_i, name_j, c))
-
-    # Nombre de fonds réellement utiles (diversification effective)
-    # Un fonds est "utile" s'il n'est pas corrélé >0.80 avec un fonds déjà retenu
-    effective_funds: List[str] = []
-    for col_i in cols:
-        is_redundant = False
-        for col_e in effective_funds:
-            if float(corr.loc[col_i, col_e]) > 0.80:
-                is_redundant = True
-                break
-        if not is_redundant:
-            effective_funds.append(col_i)
-    n_effective = len(effective_funds)
-
-    return {
-        "score": round(score, 0),
-        "avg_corr": avg_corr,
-        "doublons": doublons,
-        "vigilance": vigilance,
-        "n_lines": corr.shape[0],
-        "n_effective": n_effective,
-    }
-
-
-def _portfolio_weighted_returns(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    fee_pct: float = 0.0,
-    min_points: int = 60,
-) -> Optional[pd.Series]:
-    """Série de rendements quotidiens pondérés du portefeuille. Réutilisé par Sharpe/Sortino/Beta."""
-    rets = _build_returns_df(lines, euro_rate, min_points=min_points)
-    if rets.empty:
-        return None
-    net_by_col: Dict[str, float] = {}
-    for ln in lines:
-        label = (ln.get("name") or ln.get("isin") or "Ligne").strip()
-        isin = (ln.get("isin") or "").strip()
-        key = f"{label} ({isin})" if isin else label
-        net, _, _ = compute_line_metrics(ln, fee_pct, euro_rate)
-        if net > 0:
-            net_by_col[key] = net
-    tot = sum(net_by_col.get(c, 0.0) for c in rets.columns)
-    if tot <= 0:
-        return None
-    w_vec = np.array([net_by_col.get(c, 0.0) / tot for c in rets.columns])
-    rp = pd.Series(rets.to_numpy().dot(w_vec), index=rets.index)
-    return rp if len(rp) >= min_points else None
-
-
-def compute_sharpe_ratio(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    fee_pct: float = 0.0,
-    risk_free_rate: Optional[float] = None,
-    min_points: int = 60,
-) -> Optional[float]:
-    """
-    Ratio de Sharpe annualisé.
-    Taux sans risque = euro_rate / 100 si non fourni (alternative naturelle en AV).
-    Retourne None si données insuffisantes (< 60 jours) ou volatilité nulle.
-    """
-    rp = _portfolio_weighted_returns(lines, euro_rate, fee_pct, min_points)
-    if rp is None:
-        return None
-    rf = risk_free_rate if risk_free_rate is not None else euro_rate / 100.0
-    ret_ann = rp.mean() * 252.0
-    vol_ann = rp.std() * np.sqrt(252.0)
-    if vol_ann == 0:
-        return None
-    return float((ret_ann - rf) / vol_ann)
-
-
-def compute_sortino_ratio(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    fee_pct: float = 0.0,
-    risk_free_rate: Optional[float] = None,
-    min_points: int = 60,
-) -> Optional[float]:
-    """
-    Ratio de Sortino annualisé — pénalise uniquement la volatilité à la baisse.
-    Retourne None si données insuffisantes ou aucun rendement négatif.
-    """
-    rp = _portfolio_weighted_returns(lines, euro_rate, fee_pct, min_points)
-    if rp is None:
-        return None
-    rf = risk_free_rate if risk_free_rate is not None else euro_rate / 100.0
-    ret_ann = rp.mean() * 252.0
-    downside = rp[rp < 0]
-    if len(downside) == 0:
-        return None
-    downside_dev = downside.std() * np.sqrt(252.0)
-    if downside_dev == 0:
-        return None
-    return float((ret_ann - rf) / downside_dev)
-
-
-def compute_beta_alpha(
-    lines: List[Dict[str, Any]],
-    euro_rate: float,
-    fee_pct: float = 0.0,
-    benchmark_symbol: str = "CW8.PA",
-    risk_free_rate: Optional[float] = None,
-    min_points: int = 60,
-) -> Optional[Dict[str, Any]]:
-    """
-    Bêta et Alpha de Jensen par rapport à l'indice de référence.
-    Retourne {"beta": float, "alpha_pct": float, "benchmark_name": str} ou None.
-    """
-    rp = _portfolio_weighted_returns(lines, euro_rate, fee_pct, min_points)
-    if rp is None:
-        return None
-
-    # Récupérer la série benchmark avec fallbacks
-    df_bench: pd.DataFrame = pd.DataFrame()
-    bench_name = benchmark_symbol
-    for sym in [benchmark_symbol, "CW8.PA", "IWDA.AS"]:
-        df_b, _, _ = get_price_series(sym, None, 0.0)
-        if not df_b.empty:
-            df_bench = df_b
-            bench_name = sym
-            break
-    if df_bench.empty:
-        return None
-
-    rb = df_bench["Close"].astype(float).pct_change().dropna()
-    rb.index = pd.DatetimeIndex([pd.Timestamp(x).normalize() for x in rb.index])
-
-    # Aligner les deux séries sur les dates communes
-    common = rp.index.intersection(rb.index)
-    if len(common) < min_points:
-        return None
-    rp_c = rp.loc[common]
-    rb_c = rb.loc[common]
-
-    var_b = float(rb_c.var())
-    if var_b == 0:
-        return None
-    beta = float(np.cov(rp_c.values, rb_c.values)[0, 1] / var_b)
-
-    rf = risk_free_rate if risk_free_rate is not None else euro_rate / 100.0
-    ret_ann_p = rp_c.mean() * 252.0
-    ret_ann_b = rb_c.mean() * 252.0
-    alpha_pct = float((ret_ann_p - (rf + beta * (ret_ann_b - rf))) * 100.0)
-
-    return {"beta": beta, "alpha_pct": alpha_pct, "benchmark_name": bench_name}
-
-
 def _corr_heatmap_chart(corr: pd.DataFrame, title: str) -> Optional[alt.Chart]:
     """
-    Heatmap de corrélation — triangle inférieur uniquement,
-    palette divergente RdYlGn inversée (rouge=corrélé, vert=décorrélé).
+    Construit une heatmap Altair pour visualiser la matrice de corrélation.
     """
     if corr.empty or corr.shape[0] < 2:
         return None
-    labels = list(corr.index)
-    rows = []
-    for i, r in enumerate(labels):
-        for j, c in enumerate(labels):
-            if j <= i:  # triangle inférieur + diagonale
-                rows.append({
-                    "Ligne1": r,
-                    "Ligne2": c,
-                    "corr": float(corr.loc[r, c]),
-                    "sort_i": i,
-                    "sort_j": j,
-                })
-    df_melt = pd.DataFrame(rows)
-    base = alt.Chart(df_melt).encode(
-        x=alt.X("Ligne1:O", sort=labels, title="", axis=alt.Axis(labelAngle=-35)),
-        y=alt.Y("Ligne2:O", sort=labels[::-1], title=""),
+
+    df_corr = corr.copy()
+    df_corr["Ligne1"] = df_corr.index
+    df_melt = df_corr.melt(id_vars="Ligne1", var_name="Ligne2", value_name="corr")
+
+    base = (
+        alt.Chart(df_melt)
+        .encode(
+            x=alt.X("Ligne1:O", sort=None, title=""),
+            y=alt.Y("Ligne2:O", sort=None, title=""),
+        )
     )
+
     heat = base.mark_rect().encode(
-        color=alt.Color(
-            "corr:Q",
-            scale=alt.Scale(
-                domain=[-1, 0, 1],
-                range=["#1a9641", "#ffffbf", "#d7191c"],
-                type="linear",
-            ),
-            legend=alt.Legend(title="Corrélation", format=".2f"),
-        ),
+        color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
         tooltip=[
             alt.Tooltip("Ligne1:N", title="Ligne 1"),
             alt.Tooltip("Ligne2:N", title="Ligne 2"),
             alt.Tooltip("corr:Q", title="Corrélation", format=".2f"),
         ],
     )
-    text = base.mark_text(
-        baseline="middle",
-        fontSize=11,
-        fontWeight="bold",
-    ).encode(
+
+    text = base.mark_text(baseline="middle").encode(
         text=alt.Text("corr:Q", format=".2f"),
-        color=alt.condition(
-            "datum.corr > 0.5 || datum.corr < -0.5",
-            alt.value("white"),
-            alt.value("#333333"),
-        ),
     )
-    return (heat + text).properties(title=title, height=max(220, len(labels) * 48))
+
+    return (heat + text).properties(title=title, height=300)
 
 # ------------------------------------------------------------
 # Blocs de saisie : soit fonds recommandés, soit saisie libre
@@ -1924,7 +1750,7 @@ def _add_from_reco_block(port_key: str, label: str):
         )
 
         st.caption(
-            f"Date d'investissement initiale : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}"
+            f"Date d’investissement initiale : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}"
         )
 
         if st.button("➕ Ajouter le produit structuré", key=f"struct_add_{port_key}"):
@@ -1948,8 +1774,7 @@ def _add_from_reco_block(port_key: str, label: str):
                 "sym_used": "STRUCTURED",
             }
             st.session_state[port_key].append(ln)
-            st.toast("✅ Produit structuré ajouté.", icon="✅")
-            st.rerun()
+            st.success("Produit structuré ajouté.")
         return  # ✅ IMPORTANT : on sort de la fonction pour ne pas afficher la partie fonds
 
     # ============================
@@ -1969,9 +1794,9 @@ def _add_from_reco_block(port_key: str, label: str):
     with c1:
         amount = st.text_input("Montant investi (brut) €", value="", key=f"reco_amt_{port_key}")
     with c2:
-        st.caption(f"Date d'achat (versement initial) : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}")
+        st.caption(f"Date d’achat (versement initial) : {pd.Timestamp(buy_date).strftime('%d/%m/%Y')}")
 
-    px = st.text_input("Prix d'achat (optionnel)", value="", key=f"reco_px_{port_key}")
+    px = st.text_input("Prix d’achat (optionnel)", value="", key=f"reco_px_{port_key}")
 
     if st.button("➕ Ajouter ce fonds recommandé", key=f"reco_add_{port_key}"):
         try:
@@ -1992,8 +1817,7 @@ def _add_from_reco_block(port_key: str, label: str):
             "sym_used": "",
         }
         st.session_state[port_key].append(ln)
-        st.toast("✅ Fonds recommandé ajouté.", icon="✅")
-        st.rerun()
+        st.success("Fonds recommandé ajouté.")
 
 
 def _add_line_form_free(port_key: str, label: str):
@@ -2016,11 +1840,11 @@ def _add_line_form_free(port_key: str, label: str):
         with c2:
             amount = st.text_input("Montant investi (brut) €", value="")
             st.caption(
-                f"Date d'achat (versement initial) : "
+                f"Date d’achat (versement initial) : "
                 f"{pd.Timestamp(buy_date_central).strftime('%d/%m/%Y')}"
             )
 
-        px = st.text_input("Prix d'achat (optionnel)", value="")
+        px = st.text_input("Prix d’achat (optionnel)", value="")
         note = st.text_input("Note (optionnel)", value="")
         add_btn = st.form_submit_button("➕ Ajouter cette ligne")
 
@@ -3041,7 +2865,7 @@ def render_portfolio_builder():
             st.info("Part UC nulle avec le profil choisi.")
             return
 
-        cap_uc_final = 0.20  # max 20% du portefeuille total par fonds
+        cap_uc_final = 0.25
         uc_max_bound = min(cap_uc_final / uc_total, 1.0)
 
         def _risk_parity_weights(ret_df: pd.DataFrame) -> Dict[str, float]:
@@ -3440,8 +3264,7 @@ def _add_fund_from_contract(port_key: str, label: str):
                     "sym_used":      "EUROFUND",
                     "fee_total_pct": 0.0,
                 })
-                st.toast(f"✅ {ef_selected} ajouté.", icon="✅")
-                st.rerun()
+                st.success(f"{ef_selected} ajouté.")
 
     # ── Sous-section 2 : Fonds obligataires ──────────────────
     st.markdown("#### Fonds obligataires")
@@ -3549,8 +3372,7 @@ def _add_fund_from_contract(port_key: str, label: str):
                                 "fee_contract_pct": bond_row["fee_contract_pct"],
                                 "fee_total_pct":    bond_row["fee_total_pct"],
                             })
-                            st.toast(f"✅ {bond_row['name']} ajouté.", icon="✅")
-                            st.rerun()
+                            st.success(f"{bond_row['name']} ajouté.")
 
     # ═══════════════════════════════════════════════════════════
     # BLOC B — Autres UC
@@ -3664,333 +3486,7 @@ def _add_fund_from_contract(port_key: str, label: str):
                     "fee_contract_pct": other_row["fee_contract_pct"],
                     "fee_total_pct":    other_row["fee_total_pct"],
                 })
-                st.toast(f"✅ {other_row['name']} ajouté.", icon="✅")
-                st.rerun()
-
-
-def _build_onepager_pdf(report: Dict[str, Any]) -> bytes:
-    """
-    Génère un PDF one-pager 'Proposition d'Arbitrage' prêt à présenter.
-    Inclut : état actuel vs cible, gain estimé, économie frais/fiscalité.
-    """
-    if not REPORTLAB_AVAILABLE:
-        return b""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.colors import HexColor, white, black
-    from reportlab.platypus import (
-        SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
-    )
-    from reportlab.lib import colors
-    from reportlab.lib.units import cm
-    from io import BytesIO
-    NAVY   = HexColor("#1B2A4A")
-    GOLD   = HexColor("#C9A84C")
-    STEEL  = HexColor("#4A6FA5")
-    LIGHT  = HexColor("#F5F7FA")
-    buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=1.8*cm, rightMargin=1.8*cm,
-        topMargin=1.5*cm, bottomMargin=1.5*cm,
-    )
-    styles = getSampleStyleSheet()
-    story = []
-    def _h(txt, color=NAVY, size=16):
-        return Paragraph(
-            f'<font color="#{color.hexval()[2:]}" size="{size}"><b>{txt}</b></font>',
-            styles["Normal"]
-        )
-    def _p(txt, size=9):
-        return Paragraph(f'<font size="{size}">{txt}</font>', styles["Normal"])
-    def _kpi(label, value, delta=None):
-        val_str = f'<font size="14" color="#1B2A4A"><b>{value}</b></font>'
-        lbl_str = f'<font size="8" color="#666666">{label}</font>'
-        d_str = f'<br/><font size="9" color="#2E86AB">{delta}</font>' if delta else ""
-        return Paragraph(f'{lbl_str}<br/>{val_str}{d_str}', styles["Normal"])
-    # ── En-tête ──────────────────────────────────────────────────────
-    nom_client = report.get("nom_client", "Client") or "Client"
-    nom_cabinet = report.get("nom_cabinet", "Cabinet") or "Cabinet"
-    as_of = report.get("as_of", "")
-    header_data = [[
-        Paragraph(f'<font color="white" size="18"><b>PROPOSITION D\'ARBITRAGE</b></font>'
-                  f'<br/><font color="white" size="9">{nom_cabinet}</font>',
-                  styles["Normal"]),
-        Paragraph(f'<font color="white" size="10"><b>{nom_client}</b></font>'
-                  f'<br/><font color="white" size="8">Au {as_of}</font>',
-                  styles["Normal"]),
-    ]]
-    header_tbl = Table(header_data, colWidths=[11*cm, 6*cm])
-    header_tbl.setStyle(TableStyle([
-        ("BACKGROUND",  (0,0), (-1,-1), NAVY),
-        ("TEXTCOLOR",   (0,0), (-1,-1), white),
-        ("ALIGN",       (1,0), (1,0),   "RIGHT"),
-        ("VALIGN",      (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",  (0,0), (-1,-1), 12),
-        ("BOTTOMPADDING",(0,0),(-1,-1), 12),
-        ("LEFTPADDING", (0,0), (-1,-1), 12),
-        ("ROUNDEDCORNERS", [4]),
-    ]))
-    story.append(header_tbl)
-    story.append(Spacer(1, 14))
-    # ── Bloc 1 : État actuel vs Cible ────────────────────────────────
-    story.append(_h("① État actuel vs Portefeuille cible", NAVY, 12))
-    story.append(HRFlowable(width="100%", thickness=1, color=GOLD, spaceAfter=6))
-    synth_a = report.get("client_summary", {})
-    synth_b = report.get("valority_summary", {})
-    comp    = report.get("comparison", {})
-    def _eur(v):
-        try:
-            return f"{float(v):,.0f} €".replace(",", " ")
-        except Exception:
-            return "—"
-    def _pct(v):
-        try:
-            return f"{float(v):.2f} %"
-        except Exception:
-            return "—"
-    compare_data = [
-        ["", "Portefeuille actuel (Client)", "Portefeuille cible (Cabinet)"],
-        ["Valeur actuelle",
-         _eur(synth_a.get("val", 0)), _eur(synth_b.get("val", 0))],
-        ["Versements nets",
-         _eur(synth_a.get("net", 0)), _eur(synth_b.get("net", 0))],
-        ["Gain net",
-         _eur(synth_a.get("val", 0) - synth_a.get("net", 0)),
-         _eur(synth_b.get("val", 0) - synth_b.get("net", 0))],
-        ["XIRR (annualisé)",
-         _pct(synth_a.get("irr_pct", 0)), _pct(synth_b.get("irr_pct", 0))],
-        ["Performance totale",
-         _pct(synth_a.get("perf_tot_pct", 0)), _pct(synth_b.get("perf_tot_pct", 0))],
-    ]
-    cmp_tbl = Table(compare_data, colWidths=[5*cm, 5.5*cm, 5.5*cm])
-    cmp_tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0), (-1,0),  NAVY),
-        ("TEXTCOLOR",    (0,0), (-1,0),  white),
-        ("BACKGROUND",   (0,1), (-1,-1), LIGHT),
-        ("BACKGROUND",   (2,1), (2,-1),  HexColor("#EAF4FB")),
-        ("FONTSIZE",     (0,0), (-1,-1), 8),
-        ("FONTNAME",     (0,0), (-1,0),  "Helvetica-Bold"),
-        ("ALIGN",        (1,0), (-1,-1), "CENTER"),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1), [LIGHT, white]),
-        ("GRID",         (0,0), (-1,-1), 0.3, HexColor("#CCCCCC")),
-        ("TOPPADDING",   (0,0), (-1,-1), 5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),  5),
-    ]))
-    story.append(cmp_tbl)
-    story.append(Spacer(1, 14))
-    # ── Bloc 2 : Gain de performance estimé ──────────────────────────
-    story.append(_h("② Gain de performance net estimé", NAVY, 12))
-    story.append(HRFlowable(width="100%", thickness=1, color=GOLD, spaceAfter=6))
-    delta_val  = comp.get("delta_val", 0.0)
-    delta_xirr = comp.get("delta_perf_pct", 0.0)
-    kpi_data = [[
-        _kpi("Gain de valeur estimé", _eur(delta_val),
-             "Valeur Cabinet − Valeur Client"),
-        _kpi("Gain XIRR annualisé", _pct(delta_xirr),
-             "Performance supplémentaire annualisée"),
-        _kpi("Horizon recommandé", "Long terme (≥8 ans)",
-             "Pour bénéficier de l'abattement AV"),
-    ]]
-    kpi_tbl = Table(kpi_data, colWidths=[5.5*cm, 5.5*cm, 5.5*cm])
-    kpi_tbl.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
-        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("TOPPADDING",    (0,0), (-1,-1), 10),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
-        ("BOX",           (0,0), (-1,-1), 1, GOLD),
-        ("INNERGRID",     (0,0), (-1,-1), 0.5, HexColor("#CCCCCC")),
-    ]))
-    story.append(kpi_tbl)
-    story.append(Spacer(1, 14))
-    # ── Bloc 3 : Économie frais / fiscalité ──────────────────────────
-    story.append(_h("③ Économie de frais & levier fiscal", NAVY, 12))
-    story.append(HRFlowable(width="100%", thickness=1, color=GOLD, spaceAfter=6))
-    fees = report.get("fees_analysis", {})
-    val_a = float(synth_a.get("val", 0) or 0)
-    val_b = float(synth_b.get("val", 0) or 0)
-    fee_a_pct = float(report.get("fee_a_pct", 0.6))
-    fee_b_pct = float(report.get("fee_b_pct", 0.6))
-    econo_frais_an = val_a * max(0.0, fee_a_pct - fee_b_pct) / 100.0
-    eco_data = [
-        ["Levier", "Impact estimé", "Note"],
-        ["Économie frais contrat/an",
-         _eur(econo_frais_an),
-         f"Si passage de {fee_a_pct:.2f}% → {fee_b_pct:.2f}%/an"],
-        ["Abattement AV (célibataire, ≥8 ans)",
-         "4 600 €/an d'IR évité",
-         "Sur la quote-part de gains dans le rachat"],
-        ["Abattement AV (couple, ≥8 ans)",
-         "9 200 €/an d'IR évité",
-         "Sur la quote-part de gains dans le rachat"],
-        ["Transmission (Art. 990I)",
-         "152 500 € exonérés/bénéficiaire",
-         "Pour versements avant 70 ans"],
-    ]
-    eco_tbl = Table(eco_data, colWidths=[5.5*cm, 4.5*cm, 7*cm])
-    eco_tbl.setStyle(TableStyle([
-        ("BACKGROUND",   (0,0), (-1,0),  STEEL),
-        ("TEXTCOLOR",    (0,0), (-1,0),  white),
-        ("BACKGROUND",   (0,1), (-1,-1), LIGHT),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1), [LIGHT, white]),
-        ("FONTSIZE",     (0,0), (-1,-1), 8),
-        ("FONTNAME",     (0,0), (-1,0),  "Helvetica-Bold"),
-        ("GRID",         (0,0), (-1,-1), 0.3, HexColor("#CCCCCC")),
-        ("TOPPADDING",   (0,0), (-1,-1), 5),
-        ("BOTTOMPADDING",(0,0),(-1,-1),  5),
-    ]))
-    story.append(eco_tbl)
-    story.append(Spacer(1, 14))
-    # ── Pied de page légal ───────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=0.5, color=HexColor("#CCCCCC")))
-    story.append(Spacer(1, 4))
-    story.append(_p(
-        "Document à titre indicatif — ne constitue pas un conseil en investissement. "
-        "Performances passées ne préjugent pas des performances futures. "
-        f"Généré par {nom_cabinet} • {as_of}" if nom_cabinet else f"Document confidentiel • {as_of}",
-        size=7,
-    ))
-    doc.build(story)
-    return buf.getvalue()
-
-
-# ── Helpers d'interprétation des ratios (module level) ──────────────────────
-
-def _interpret_sharpe(val: Optional[float]) -> Tuple[str, str, str]:
-    """Retourne (emoji_couleur, verdict_court, phrase_client)."""
-    if val is None:
-        return "⚪", "Données insuffisantes", "Pas assez d'historique pour calculer ce ratio."
-    if val >= 1.0:
-        return "🟢", "Excellent", f"Pour chaque unité de risque prise, le portefeuille génère {val:.2f} unité de rendement excédentaire. C'est un très bon ratio."
-    if val >= 0.5:
-        return "🟢", "Bon", f"Le portefeuille offre un bon compromis rendement/risque (Sharpe {val:.2f})."
-    if val >= 0.0:
-        return "🟠", "Moyen", f"Le rendement compense à peine le risque pris (Sharpe {val:.2f}). Une optimisation est possible."
-    return "🔴", "Négatif", f"Le portefeuille perd de l'argent par rapport au fonds euros après ajustement du risque (Sharpe {val:.2f})."
-
-
-def _interpret_sharpe_short(val: Optional[float]) -> str:
-    """Verdict court pour st.metric delta."""
-    if val is None:
-        return "—"
-    if val >= 1.0:
-        return "🟢 Excellent"
-    if val >= 0.5:
-        return "🟢 Bon"
-    if val >= 0.0:
-        return "🟠 Moyen"
-    return "🔴 Négatif"
-
-
-def _interpret_sortino_short(val: Optional[float]) -> str:
-    if val is None:
-        return "—"
-    if val >= 1.5:
-        return "🟢 Excellente protection"
-    if val >= 0.8:
-        return "🟢 Bonne protection"
-    if val >= 0.0:
-        return "🟠 Protection limitée"
-    return "🔴 Vulnérable"
-
-
-def _interpret_beta_short(val: Optional[float]) -> str:
-    if val is None:
-        return "—"
-    if val < 0.5:
-        return "🟢 Très défensif"
-    if val < 0.8:
-        return "🟢 Défensif"
-    if val < 1.2:
-        return "🟠 Neutre (marché)"
-    return "🔴 Agressif"
-
-
-def _interpret_sortino(val: Optional[float]) -> Tuple[str, str, str]:
-    if val is None:
-        return "⚪", "—", ""
-    if val >= 1.5:
-        return "🟢", "Excellente protection", f"Le Sortino de {val:.2f} montre que le portefeuille limite très bien les baisses."
-    if val >= 0.8:
-        return "🟢", "Bonne protection", f"Sortino de {val:.2f} : les pertes sont contenues par rapport aux gains."
-    if val >= 0.0:
-        return "🟠", "Protection limitée", f"Sortino de {val:.2f} : le portefeuille est vulnérable en cas de baisse."
-    return "🔴", "Vulnérable", f"Sortino négatif ({val:.2f}) : le portefeuille souffre particulièrement dans les phases baissières."
-
-
-def _interpret_beta(val: Optional[float]) -> Tuple[str, str, str]:
-    if val is None:
-        return "⚪", "—", ""
-    if val < 0.5:
-        return "🟢", "Très défensif", f"Bêta de {val:.2f} : le portefeuille ne bouge que de {val*100:.0f}% quand le marché bouge de 100%. Très protecteur."
-    if val < 0.8:
-        return "🟢", "Défensif", f"Bêta de {val:.2f} : le portefeuille amortit les mouvements du marché."
-    if val < 1.2:
-        return "🟠", "Neutre", f"Bêta de {val:.2f} : le portefeuille suit globalement le marché."
-    return "🔴", "Agressif", f"Bêta de {val:.2f} : le portefeuille amplifie les mouvements du marché. Plus de potentiel mais plus de risque."
-
-
-def _render_ratios_card(
-    sharpe: Optional[float],
-    sortino: Optional[float],
-    beta_alpha: Optional[Dict[str, Any]],
-    euro_rate: float,
-) -> None:
-    """Affiche les 3 ratios dans un container bordé avec interprétation colorée."""
-    with st.container(border=True):
-        # ── Sharpe ──
-        _sh_emoji, _sh_verdict, _sh_phrase = _interpret_sharpe(sharpe)
-        st.metric(
-            f"{_sh_emoji} Ratio de Sharpe",
-            f"{sharpe:.2f}" if sharpe is not None else "—",
-            delta=_sh_verdict,
-        )
-        st.caption(_sh_phrase)
-
-        st.markdown("---")
-
-        # ── Sortino ──
-        _so_emoji, _so_verdict, _so_phrase = _interpret_sortino(sortino)
-        st.metric(
-            f"{_so_emoji} Ratio de Sortino",
-            f"{sortino:.2f}" if sortino is not None else "—",
-            delta=_so_verdict,
-        )
-        if _so_phrase:
-            st.caption(_so_phrase)
-
-        st.markdown("---")
-
-        # ── Bêta ──
-        if beta_alpha is not None:
-            _b = beta_alpha["beta"]
-            _a = beta_alpha["alpha_pct"]
-            _bn = beta_alpha["benchmark_name"]
-            _be_emoji, _be_verdict, _be_phrase = _interpret_beta(_b)
-            st.metric(
-                f"{_be_emoji} Bêta (vs {_bn})",
-                f"{_b:.2f}",
-                delta=_be_verdict,
-            )
-            st.caption(_be_phrase)
-            if _a is not None:
-                _alpha_color = "🟢" if _a > 0 else "🔴"
-                st.caption(
-                    f"{_alpha_color} Alpha de Jensen : {_a:+.2f}%/an — "
-                    + ("le portefeuille crée de la valeur au-delà du marché."
-                       if _a > 0
-                       else "le portefeuille sous-performe par rapport à ce que son niveau de risque devrait générer.")
-                )
-        else:
-            st.metric("⚪ Bêta", "—")
-            st.caption("Indice de référence indisponible ou historique insuffisant.")
-
-        # ── Note méthodologique ──
-        st.caption(
-            f"_Taux sans risque utilisé : {euro_rate:.2f}% (taux fonds euros du contrat). "
-            f"Calculs sur l'historique complet des VL disponibles._"
-        )
+                st.success(f"{other_row['name']} ajouté.")
 
 
 def render_app(run_page_config: bool = True):
@@ -3999,15 +3495,9 @@ def render_app(run_page_config: bool = True):
     # ------------------------------------------------------------
     if run_page_config:
         st.set_page_config(page_title=APP_TITLE, layout="wide")
-    _nom_cab_display = st.session_state.get("NOM_CABINET", "").strip()
-    st.title(_nom_cab_display if _nom_cab_display else APP_TITLE)
-    st.caption(APP_SUBTITLE)
-    _nom = st.session_state.get("NOM_CLIENT", "").strip()
-    if _nom:
-        st.markdown(f"**Dossier client :** {_nom}")
+    st.title(APP_TITLE)
+    st.info(f"App chargée, statut {st.session_state.get('APP_STATUS', 'OK')}")
     # Init state
-    st.session_state.setdefault("NOM_CLIENT", "")
-    st.session_state.setdefault("NOM_CABINET", "")
     st.session_state.setdefault("A_lines", [])
     st.session_state.setdefault("B_lines", [])
     st.session_state.setdefault("FEE_A", 3.0)
@@ -4030,176 +3520,176 @@ def render_app(run_page_config: bool = True):
     # Sidebar : paramètres globaux
     # -------------------------------------------------------------------
     with st.sidebar:
+        # ── Contrat client ─────────────────────────────────────────
+        st.header("Contrat client")
+        contract_label_A = st.selectbox(
+            "Contrat client",
+            list(CONTRACTS_REGISTRY.keys()),
+            key="CONTRACT_LABEL_A",
+        )
+        contract_cfg_A = CONTRACTS_REGISTRY[contract_label_A]
+        try:
+            funds_df_A = load_contract_funds(
+                contract_cfg_A["path"], contract_cfg_A["funds_filename"]
+            )
+        except Exception:
+            funds_df_A = pd.DataFrame()
+        st.session_state["CONTRACT_FUNDS_DF_A"] = funds_df_A
+
+        euro_fund_label_A = st.selectbox(
+            "Fonds en euros client",
+            list(contract_cfg_A["euro_funds"].keys()),
+            key="EURO_FUND_LABEL_A",
+        )
+        try:
+            euro_history_df_A = load_euro_fund_history(
+                contract_cfg_A["path"], contract_cfg_A["euro_funds"][euro_fund_label_A]
+            )
+        except Exception:
+            euro_history_df_A = pd.DataFrame()
+        avg_rate_A = get_euro_fund_avg_rate(euro_history_df_A, years=5)
+        with st.expander(f"Historique {euro_fund_label_A}", expanded=False):
+            if not euro_history_df_A.empty:
+                st.dataframe(
+                    euro_history_df_A.rename(columns={
+                        "annee": "Année", "taux_net_publie_pct": "Taux net publié %"
+                    }),
+                    hide_index=True, use_container_width=True,
+                )
+            st.caption(f"Moyenne sur 5 dernières années : **{avg_rate_A:.2f}%**")
+
         st.markdown("---")
-        # ── Nom du client et du cabinet ────────────────────────────
-        st.session_state.setdefault("NOM_CLIENT", "")
-        NOM_CLIENT = st.text_input(
-            "Nom du client",
-            value=st.session_state.get("NOM_CLIENT", ""),
-            key="NOM_CLIENT",
-            placeholder="Ex : M. et Mme Dupont",
+
+        # ── Contrat cabinet ────────────────────────────────────────
+        st.header("Contrat cabinet")
+        contract_label_B = st.selectbox(
+            "Contrat cabinet",
+            list(CONTRACTS_REGISTRY.keys()),
+            key="CONTRACT_LABEL_B",
         )
-        st.session_state.setdefault("NOM_CABINET", "")
-        NOM_CABINET = st.text_input(
-            "Nom du cabinet",
-            value=st.session_state.get("NOM_CABINET", ""),
-            key="NOM_CABINET",
-            placeholder="Ex : Cabinet Dupont Patrimoine",
+        contract_cfg_B = CONTRACTS_REGISTRY[contract_label_B]
+        try:
+            funds_df_B = load_contract_funds(
+                contract_cfg_B["path"], contract_cfg_B["funds_filename"]
+            )
+        except Exception:
+            funds_df_B = pd.DataFrame()
+        st.session_state["CONTRACT_FUNDS_DF_B"] = funds_df_B
+
+        euro_fund_label_B = st.selectbox(
+            "Fonds en euros cabinet",
+            list(contract_cfg_B["euro_funds"].keys()),
+            key="EURO_FUND_LABEL_B",
         )
-        st.divider()
-
-        # ── Section 1 — Contrats ────────────────────────────────────
-        with st.expander("① Contrats", expanded=True):
-            st.markdown("**Portefeuille Client**")
-            contract_label_A = st.selectbox(
-                "Contrat client",
-                list(CONTRACTS_REGISTRY.keys()),
-                key="CONTRACT_LABEL_A",
+        try:
+            euro_history_df_B = load_euro_fund_history(
+                contract_cfg_B["path"], contract_cfg_B["euro_funds"][euro_fund_label_B]
             )
-            contract_cfg_A = CONTRACTS_REGISTRY[contract_label_A]
-            try:
-                funds_df_A = load_contract_funds(
-                    contract_cfg_A["path"], contract_cfg_A["funds_filename"]
+        except Exception:
+            euro_history_df_B = pd.DataFrame()
+        avg_rate_B = get_euro_fund_avg_rate(euro_history_df_B, years=5)
+        with st.expander(f"Historique {euro_fund_label_B}", expanded=False):
+            if not euro_history_df_B.empty:
+                st.dataframe(
+                    euro_history_df_B.rename(columns={
+                        "annee": "Année", "taux_net_publie_pct": "Taux net publié %"
+                    }),
+                    hide_index=True, use_container_width=True,
                 )
-            except Exception:
-                funds_df_A = pd.DataFrame()
-            st.session_state["CONTRACT_FUNDS_DF_A"] = funds_df_A
+            st.caption(f"Moyenne sur 5 dernières années : **{avg_rate_B:.2f}%**")
 
-            euro_fund_label_A = st.selectbox(
-                "Fonds en euros client",
-                list(contract_cfg_A["euro_funds"].keys()),
-                key="EURO_FUND_LABEL_A",
-            )
-            try:
-                euro_history_df_A = load_euro_fund_history(
-                    contract_cfg_A["path"], contract_cfg_A["euro_funds"][euro_fund_label_A]
-                )
-            except Exception:
-                euro_history_df_A = pd.DataFrame()
-            avg_rate_A = get_euro_fund_avg_rate(euro_history_df_A, years=5)
-            st.caption(
-                f"Fonds euros client — moyenne 5 ans : **{avg_rate_A:.2f}%** "
-                f"({euro_fund_label_A})"
-            )
+        st.markdown("---")
 
-            st.markdown("---")
-            st.markdown("**Portefeuille Cabinet**")
-            contract_label_B = st.selectbox(
-                "Contrat cabinet",
-                list(CONTRACTS_REGISTRY.keys()),
-                key="CONTRACT_LABEL_B",
-            )
-            contract_cfg_B = CONTRACTS_REGISTRY[contract_label_B]
-            try:
-                funds_df_B = load_contract_funds(
-                    contract_cfg_B["path"], contract_cfg_B["funds_filename"]
-                )
-            except Exception:
-                funds_df_B = pd.DataFrame()
-            st.session_state["CONTRACT_FUNDS_DF_B"] = funds_df_B
+        # Rétrocompatibilité : render_portfolio_builder() lit CONTRACT_LABEL / CONTRACT_FUNDS_DF
+        st.session_state["CONTRACT_LABEL"]    = contract_label_A
+        st.session_state["CONTRACT_CFG"]      = contract_cfg_A
+        st.session_state["CONTRACT_FUNDS_DF"] = funds_df_A
+        st.session_state["EURO_FUND_LABEL"]   = euro_fund_label_A
+        st.session_state["EURO_FUND_HISTORY"] = euro_history_df_A
+        st.session_state["EURO_FUND_AVG_RATE"] = avg_rate_A
 
-            euro_fund_label_B = st.selectbox(
-                "Fonds en euros cabinet",
-                list(contract_cfg_B["euro_funds"].keys()),
-                key="EURO_FUND_LABEL_B",
+        # ── Taux fonds en euros ───────────────────────────────────
+        st.header("Taux fonds en euros")
+        st.caption(
+            f"Client : **{avg_rate_A:.2f}%** ({euro_fund_label_A}) | "
+            f"Cabinet : **{avg_rate_B:.2f}%** ({euro_fund_label_B})"
+        )
+        override_euro = st.checkbox(
+            "Utiliser un taux personnalisé (fonds euros boosté, etc.)",
+            value=False,
+            key="OVERRIDE_EURO_RATE",
+        )
+        if override_euro:
+            euro_rate_value_A = st.number_input(
+                "Portefeuille Client — taux annuel (%)",
+                min_value=0.0, max_value=10.0,
+                value=float(st.session_state.get("EURO_RATE_A", avg_rate_A)),
+                step=0.10, key="EURO_RATE_A",
             )
-            try:
-                euro_history_df_B = load_euro_fund_history(
-                    contract_cfg_B["path"], contract_cfg_B["euro_funds"][euro_fund_label_B]
-                )
-            except Exception:
-                euro_history_df_B = pd.DataFrame()
-            avg_rate_B = get_euro_fund_avg_rate(euro_history_df_B, years=5)
-            st.caption(
-                f"Fonds euros cabinet — moyenne 5 ans : **{avg_rate_B:.2f}%** "
-                f"({euro_fund_label_B})"
+            euro_rate_value_B = st.number_input(
+                "Portefeuille Cabinet — taux annuel (%)",
+                min_value=0.0, max_value=10.0,
+                value=float(st.session_state.get("EURO_RATE_B", avg_rate_B)),
+                step=0.10, key="EURO_RATE_B",
             )
-
-            # Rétrocompatibilité : render_portfolio_builder() lit CONTRACT_LABEL / CONTRACT_FUNDS_DF
-            st.session_state["CONTRACT_LABEL"]    = contract_label_A
-            st.session_state["CONTRACT_CFG"]      = contract_cfg_A
-            st.session_state["CONTRACT_FUNDS_DF"] = funds_df_A
-            st.session_state["EURO_FUND_LABEL"]   = euro_fund_label_A
-            st.session_state["EURO_FUND_HISTORY"] = euro_history_df_A
-            st.session_state["EURO_FUND_AVG_RATE"] = avg_rate_A
-
-        # ── Section 2 — Paramètres de simulation ───────────────────
-        with st.expander("② Paramètres de simulation", expanded=True):
-            st.markdown("**Taux fonds en euros**")
-            st.caption(
-                f"Client : **{avg_rate_A:.2f}%** ({euro_fund_label_A}) | "
-                f"Cabinet : **{avg_rate_B:.2f}%** ({euro_fund_label_B})"
-            )
-            override_euro = st.checkbox(
-                "Utiliser un taux personnalisé (fonds euros boosté, etc.)",
-                value=False,
-                key="OVERRIDE_EURO_RATE",
-            )
-            if override_euro:
-                euro_rate_value_A = st.number_input(
-                    "Portefeuille Client — taux annuel (%)",
-                    min_value=0.0, max_value=10.0,
-                    value=float(st.session_state.get("EURO_RATE_A", avg_rate_A)),
-                    step=0.10, key="EURO_RATE_A",
-                )
-                euro_rate_value_B = st.number_input(
-                    "Portefeuille Cabinet — taux annuel (%)",
-                    min_value=0.0, max_value=10.0,
-                    value=float(st.session_state.get("EURO_RATE_B", avg_rate_B)),
-                    step=0.10, key="EURO_RATE_B",
-                )
+        else:
+            euro_rate_value_A = avg_rate_A
+            euro_rate_value_B = avg_rate_B
+            st.session_state["EURO_RATE_A"] = avg_rate_A
+            st.session_state["EURO_RATE_B"] = avg_rate_B
+            if avg_rate_A == avg_rate_B:
+                st.caption(f"Taux appliqué aux deux portefeuilles : **{avg_rate_A:.2f}%**")
             else:
-                euro_rate_value_A = avg_rate_A
-                euro_rate_value_B = avg_rate_B
-                st.session_state["EURO_RATE_A"] = avg_rate_A
-                st.session_state["EURO_RATE_B"] = avg_rate_B
-                if avg_rate_A == avg_rate_B:
-                    st.caption(f"Taux appliqué aux deux portefeuilles : **{avg_rate_A:.2f}%**")
-                else:
-                    st.caption(
-                        f"Taux client : **{avg_rate_A:.2f}%** | Taux cabinet : **{avg_rate_B:.2f}%**"
-                    )
-            st.caption(
-                "Frais de gestion contrat fonds euros inclus dans le taux net publié. "
-                "Frais UC contrat : lus depuis le référentiel fonds."
-            )
+                st.caption(
+                    f"Taux client : **{avg_rate_A:.2f}%** | Taux cabinet : **{avg_rate_B:.2f}%**"
+                )
+        st.caption(
+            "Frais de gestion contrat fonds euros inclus dans le taux net publié. "
+            "Frais UC contrat : lus depuis le référentiel fonds."
+        )
 
-            st.markdown("---")
-            st.markdown("**Frais d'entrée (%)**")
-            FEE_A = st.number_input(
-                "Frais d'entrée — Portefeuille 1 (Client)",
-                0.0,
-                10.0,
-                st.session_state.get("FEE_A", 3.0),
-                0.10,
-                key="FEE_A",
-            )
-            FEE_B = st.number_input(
-                "Frais d'entrée — Portefeuille 2 (Cabinet)",
-                0.0,
-                10.0,
-                st.session_state.get("FEE_B", 2.0),
-                0.10,
-                key="FEE_B",
-            )
-            st.caption("Les frais s'appliquent sur chaque investissement (initial, mensuel, ponctuel).")
+        # Frais d’entrée
+        st.header("Frais d’entrée (%)")
 
-            st.markdown("---")
-            st.markdown("**Date du versement initial**")
-            st.date_input(
-                "Portefeuille 1 (Client) — date d'investissement initiale",
-                value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
-                key="INIT_A_DATE",
-            )
-            st.date_input(
-                "Portefeuille 2 (Cabinet) — date d'investissement initiale",
-                value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
-                key="INIT_B_DATE",
-            )
+        FEE_A = st.number_input(
+            "Frais d’entrée — Portefeuille 1 (Client)",
+            0.0,
+            10.0,
+            st.session_state.get("FEE_A", 3.0),
+            0.10,
+            key="FEE_A",
+        )
 
-        # ── Section 3 — Versements ──────────────────────────────────
-        with st.expander("③ Versements", expanded=False):
-            st.markdown("**Portefeuille 1 — Client**")
+        FEE_B = st.number_input(
+            "Frais d’entrée — Portefeuille 2 (Cabinet)",
+            0.0,
+            10.0,
+            st.session_state.get("FEE_B", 2.0),
+            0.10,
+            key="FEE_B",
+        )
+
+        st.caption("Les frais s’appliquent sur chaque investissement (initial, mensuel, ponctuel).")
+
+        # Date du versement initial (centralisée)
+        st.header("Date du versement initial")
+
+        st.date_input(
+            "Portefeuille 1 (Client) — date d’investissement initiale",
+            value=st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()),
+            key="INIT_A_DATE",
+        )
+
+        st.date_input(
+            "Portefeuille 2 (Cabinet) — date d’investissement initiale",
+            value=st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()),
+            key="INIT_B_DATE",
+        )
+
+        # Paramètres de versement
+        st.header("Paramètres de versement")
+
+        with st.expander("Portefeuille 1 — Client"):
             M_A = st.number_input(
                 "Mensuel brut (€)",
                 0.0,
@@ -4221,8 +3711,8 @@ def render_app(run_page_config: bool = True):
                 value=st.session_state.get("ONE_A_DATE", pd.Timestamp("2024-07-01").date()),
                 key="ONE_A_DATE",
             )
-            st.markdown("---")
-            st.markdown("**Portefeuille 2 — Cabinet**")
+
+        with st.expander("Portefeuille 2 — Cabinet"):
             M_B = st.number_input(
                 "Mensuel brut (€)",
                 0.0,
@@ -4245,95 +3735,72 @@ def render_app(run_page_config: bool = True):
                 key="ONE_B_DATE",
             )
 
-        # ── Section 4 — Options d'analyse ──────────────────────────
-        with st.expander("④ Options d'analyse", expanded=False):
-            st.markdown("**Règle d'affectation des versements**")
-            current_code = st.session_state.get("ALLOC_MODE", "equal")
-            inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
-            current_label = inv_labels.get(current_code, "Répartition égale")
+        # Règle d’affectation
+        st.header("Règle d’affectation des versements")
 
-            mode_label = st.selectbox(
-                "Mode",
-                list(ALLOC_LABELS.keys()),
-                index=list(ALLOC_LABELS.keys()).index(current_label),
-                help="Répartition des versements entre les lignes.",
-            )
-            st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
+        current_code = st.session_state.get("ALLOC_MODE", "equal")
+        inv_labels = {v: k for k, v in ALLOC_LABELS.items()}
+        current_label = inv_labels.get(current_code, "Répartition égale")
 
-            st.markdown("---")
-            st.markdown("**Mode d'analyse**")
-            mode_ui = st.radio(
-                "Choix",
-                ["Comparer Client vs Cabinet", "Analyser uniquement Cabinet", "Analyser uniquement Client"],
-                index=0,
-                key="MODE_ANALYSE_UI",
+        mode_label = st.selectbox(
+            "Mode",
+            list(ALLOC_LABELS.keys()),
+            index=list(ALLOC_LABELS.keys()).index(current_label),
+            help="Répartition des versements entre les lignes.",
+        )
+
+        st.session_state["ALLOC_MODE"] = ALLOC_LABELS[mode_label]
+
+        st.divider()
+        st.header("Mode d’analyse")
+
+        mode_ui = st.radio(
+            "Choix",
+            ["Comparer Client vs Cabinet", "Analyser uniquement Cabinet", "Analyser uniquement Client"],
+            index=0,
+            key="MODE_ANALYSE_UI",
+        )
+
+        if "Comparer" in mode_ui:
+            st.session_state["MODE_ANALYSE"] = "compare"
+        elif "Cabinet" in mode_ui:
+            st.session_state["MODE_ANALYSE"] = "valority"
+        else:
+            st.session_state["MODE_ANALYSE"] = "client"
+
+        st.divider()
+        debug_mode = st.checkbox("Mode debug", value=False)
+        if debug_mode:
+            st.subheader("Debug")
+            st.caption("Versions & état")
+            st.code(
+                f"Python: {sys.version.split()[0]}\n"
+                f"Streamlit: {st.__version__}\n"
+                f"Pandas: {pd.__version__}"
             )
-            if "Comparer" in mode_ui:
-                st.session_state["MODE_ANALYSE"] = "compare"
-            elif "Cabinet" in mode_ui:
-                st.session_state["MODE_ANALYSE"] = "valority"
+            st.caption("Modules")
+            st.code(
+                f"Matplotlib: {MATPLOTLIB_AVAILABLE} ({MATPLOTLIB_ERROR})\n"
+                f"Reportlab: {REPORTLAB_AVAILABLE} ({REPORTLAB_ERROR})"
+            )
+            st.caption("Session state (clés)")
+            st.write(sorted(list(st.session_state.keys())))
+            st.caption("Dernière exception")
+            st.write(st.session_state.get("LAST_EXCEPTION", "—"))
+            st.caption("Test rapide EODHD")
+            if _get_api_key():
+                try:
+                    res = eodhd_get("/status")
+                    st.write(res if res is not None else "Réponse vide")
+                except Exception as e:
+                    st.write(f"Erreur EODHD: {e}")
             else:
-                st.session_state["MODE_ANALYSE"] = "client"
-
-            st.markdown("---")
-            st.markdown("**Indice de référence (Bêta)**")
-            _bench_options = {
-                "MSCI World (CW8.PA)": "CW8.PA",
-                "CAC 40 (^FCHI)": "^FCHI",
-                "Euro Stoxx 50 (^STOXX50E)": "^STOXX50E",
-                "S&P 500 (^GSPC)": "^GSPC",
-            }
-            _bench_label = st.selectbox(
-                "Indice",
-                list(_bench_options.keys()),
-                index=0,
-                key="BENCHMARK_LABEL",
-            )
-            st.session_state["BENCHMARK_SYMBOL"] = _bench_options[_bench_label]
-
-        # ── Debug (masqué en production) ────────────────────────────
-        _debug_enabled = st.secrets.get("debug_mode", False)
-        if _debug_enabled:
-            with st.expander("🔧 Debug", expanded=False):
-                st.caption("Versions & état")
-                st.code(
-                    f"Python: {sys.version.split()[0]}\n"
-                    f"Streamlit: {st.__version__}\n"
-                    f"Pandas: {pd.__version__}"
-                )
-                st.caption("Modules")
-                st.code(
-                    f"Matplotlib: {MATPLOTLIB_AVAILABLE} ({MATPLOTLIB_ERROR})\n"
-                    f"Reportlab: {REPORTLAB_AVAILABLE} ({REPORTLAB_ERROR})"
-                )
-                st.caption("Session state (clés)")
-                st.write(sorted(list(st.session_state.keys())))
-                st.caption("Dernière exception")
-                st.write(st.session_state.get("LAST_EXCEPTION", "—"))
-                st.caption("Test rapide EODHD")
-                if _get_api_key():
-                    try:
-                        res = eodhd_get("/status")
-                        st.write(res if res is not None else "Réponse vide")
-                    except Exception as e:
-                        st.write(f"Erreur EODHD: {e}")
-                else:
-                    st.write("Token EODHD absent")
+                st.write("Token EODHD absent")
 
 
     mode = st.session_state.get("MODE_ANALYSE", "compare")
     show_client = mode in ("compare", "client")
     show_valority = mode in ("compare", "valority")
-
-    # ── Synchronisation date globale → lignes (pour cohérence carte + tableau + simulation) ──
-    _global_date_A = pd.Timestamp(st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()))
-    _global_date_B = pd.Timestamp(st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()))
-    for _ln in st.session_state.get("A_lines", []):
-        if not _ln.get("date_overridden"):
-            _ln["buy_date"] = _global_date_A
-    for _ln in st.session_state.get("B_lines", []):
-        if not _ln.get("date_overridden"):
-            _ln["buy_date"] = _global_date_B
 
     # Onglets principaux : Client / Cabinet (conditionnés au mode)
     tab_labels = []
@@ -4362,6 +3829,10 @@ def render_app(run_page_config: bool = True):
     # ------------------------------------------------------------
     # Simulation (selon mode)
     # ------------------------------------------------------------
+    mode = st.session_state.get("MODE_ANALYSE", "compare")
+    show_client = mode in ("compare", "client")
+    show_valority = mode in ("compare", "valority")
+
     # FIXED: use stable UUID key instead of id() which changes on st.rerun() (Bug 5)
     _ln_a0 = st.session_state["A_lines"][0] if (show_client and st.session_state["A_lines"]) else None
     single_target_A = (_ln_a0.get("id") or id(_ln_a0)) if _ln_a0 is not None else None
@@ -4403,6 +3874,16 @@ def render_app(run_page_config: bool = True):
     dfA, brutA, netA, valA, xirrA, startA_min, fullA = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
     dfB, brutB, netB, valB, xirrB, startB_min, fullB = pd.DataFrame(), 0.0, 0.0, 0.0, None, TODAY, TODAY
 
+    # ── Synchronisation date globale → lignes (pour cohérence carte + tableau + simulation) ──
+    _global_date_A = pd.Timestamp(st.session_state.get("INIT_A_DATE", pd.Timestamp("2024-01-02").date()))
+    _global_date_B = pd.Timestamp(st.session_state.get("INIT_B_DATE", pd.Timestamp("2024-01-02").date()))
+    for _ln in st.session_state.get("A_lines", []):
+        if not _ln.get("date_overridden"):
+            _ln["buy_date"] = _global_date_A
+    for _ln in st.session_state.get("B_lines", []):
+        if not _ln.get("date_overridden"):
+            _ln["buy_date"] = _global_date_B
+
     if show_client:
         _args_A = _make_sim_args(
             lines=st.session_state.get("A_lines", []),
@@ -4418,9 +3899,6 @@ def render_app(run_page_config: bool = True):
             label="Client",
         )
         dfA, brutA, netA, valA, xirrA, startA_min, fullA = _simulate_portfolio_cached(**_args_A)
-        st.session_state["_LAST_VAL_A"] = valA
-        st.session_state["_LAST_NET_A"] = netA
-        st.session_state["_LAST_XIRR_A"] = xirrA
 
     if show_valority:
         _args_B = _make_sim_args(
@@ -4437,9 +3915,6 @@ def render_app(run_page_config: bool = True):
             label="Cabinet",
         )
         dfB, brutB, netB, valB, xirrB, startB_min, fullB = _simulate_portfolio_cached(**_args_B)
-        st.session_state["_LAST_VAL_B"] = valB
-        st.session_state["_LAST_NET_B"] = netB
-        st.session_state["_LAST_XIRR_B"] = xirrB
 
     # ------------------------------------------------------------
     # Avertissements sur les dates / 1ère VL
@@ -4452,8 +3927,7 @@ def render_app(run_page_config: bool = True):
     # ------------------------------------------------------------
     # Graphique (évolution des portefeuilles)
     # ------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("📈 Comment s'est comporté votre portefeuille")
+    st.subheader("Évolution de la valeur des portefeuilles")
 
     # Déterminer le start_plot uniquement sur les portefeuilles affichés
     full_dates: List[pd.Timestamp] = []
@@ -4489,96 +3963,6 @@ def render_app(run_page_config: bool = True):
             y_domain = [max(0.0, y_min - padding), y_max + padding]
         else:
             y_domain = [0, 1]
-
-        # ── Bandeau KPIs adapté au mode ──────────────────────────────
-        with st.container(border=True):
-            if mode == "compare":
-                _has_A = show_client and not dfA.empty and netA > 0
-                _has_B = show_valority and not dfB.empty and netB > 0
-                if _has_A and _has_B:
-                    _kpi_cols = st.columns(4)
-                    with _kpi_cols[0]:
-                        st.metric(
-                            "Rendement client (%/an)",
-                            f"{xirrA:.2f} %" if xirrA is not None else "—",
-                            help="Rendement annualisé (XIRR), net des frais de gestion du contrat",
-                        )
-                    with _kpi_cols[1]:
-                        st.metric(
-                            "Rendement simulation (%/an)",
-                            f"{xirrB:.2f} %" if xirrB is not None else "—",
-                            delta=f"{(xirrB - xirrA):.2f} pts"
-                            if (xirrA is not None and xirrB is not None) else None,
-                        )
-                    with _kpi_cols[2]:
-                        _gain_client = (valA - netA) if netA > 0 else 0.0
-                        st.metric("Gain net Client", to_eur(_gain_client))
-                    with _kpi_cols[3]:
-                        _gain_cabinet = (valB - netB) if netB > 0 else 0.0
-                        st.metric(
-                            "Gain net Cabinet", to_eur(_gain_cabinet),
-                            delta=to_eur(_gain_cabinet - _gain_client) if netA > 0 else None,
-                        )
-                elif _has_A:
-                    _pad_l, _k0, _k1, _k2, _pad_r = st.columns([0.5, 1, 1, 1, 0.5])
-                    with _k0:
-                        st.metric(
-                            "Rendement client (%/an)",
-                            f"{xirrA:.2f} %" if xirrA is not None else "—",
-                            help="Rendement annualisé (XIRR), net des frais de gestion du contrat",
-                        )
-                    with _k1:
-                        _gain_client = (valA - netA) if netA > 0 else 0.0
-                        st.metric("Gain net", to_eur(_gain_client))
-                    with _k2:
-                        _perf_cli = (valA / netA - 1.0) * 100.0 if netA > 0 else 0.0
-                        st.metric("Performance totale", f"{_perf_cli:+.2f}%")
-                elif _has_B:
-                    _pad_l, _k0, _k1, _k2, _pad_r = st.columns([0.5, 1, 1, 1, 0.5])
-                    with _k0:
-                        st.metric(
-                            "Rendement simulation (%/an)",
-                            f"{xirrB:.2f} %" if xirrB is not None else "—",
-                            help="Rendement annualisé (XIRR), net des frais de gestion du contrat",
-                        )
-                    with _k1:
-                        _gain_cabinet = (valB - netB) if netB > 0 else 0.0
-                        st.metric("Gain net", to_eur(_gain_cabinet))
-                    with _k2:
-                        _perf_val = (valB / netB - 1.0) * 100.0 if netB > 0 else 0.0
-                        st.metric("Performance totale", f"{_perf_val:+.2f}%")
-            elif mode == "client":
-                _pad_l, _kpi_cols0, _kpi_cols1, _kpi_cols2, _pad_r = st.columns([0.5, 1, 1, 1, 0.5])
-                _kpi_cols = [_kpi_cols0, _kpi_cols1, _kpi_cols2]
-                with _kpi_cols[0]:
-                    st.metric(
-                        "Rendement client (%/an)",
-                        f"{xirrA:.2f} %" if xirrA is not None else "—",
-                        help="Rendement annualisé (XIRR), net des frais de gestion du contrat",
-                    )
-                with _kpi_cols[1]:
-                    _gain_client = (valA - netA) if netA > 0 else 0.0
-                    st.metric("Gain net", to_eur(_gain_client))
-                with _kpi_cols[2]:
-                    _perf_cli = (valA / netA - 1.0) * 100.0 if netA > 0 else 0.0
-                    st.metric("Performance totale", f"{_perf_cli:+.2f}%")
-            else:  # valority
-                _pad_l, _kpi_cols0, _kpi_cols1, _kpi_cols2, _pad_r = st.columns([0.5, 1, 1, 1, 0.5])
-                _kpi_cols = [_kpi_cols0, _kpi_cols1, _kpi_cols2]
-                with _kpi_cols[0]:
-                    st.metric(
-                        "Rendement simulation (%/an)",
-                        f"{xirrB:.2f} %" if xirrB is not None else "—",
-                        help="Rendement annualisé (XIRR), net des frais de gestion du contrat",
-                    )
-                with _kpi_cols[1]:
-                    _gain_cabinet = (valB - netB) if netB > 0 else 0.0
-                    st.metric("Gain net", to_eur(_gain_cabinet))
-                with _kpi_cols[2]:
-                    _perf_val = (valB / netB - 1.0) * 100.0 if netB > 0 else 0.0
-                    st.metric("Performance totale", f"{_perf_val:+.2f}%")
-
-        # ── Graphique line chart (rendu direct, sans placeholder) ────
         base = (
             alt.Chart(chart_long)
             .mark_line()
@@ -4601,73 +3985,10 @@ def render_app(run_page_config: bool = True):
         )
         st.altair_chart(base, use_container_width=True)
 
-        # ── Bloc storytelling percutant ──────────────────────────────
-        if mode == "compare" and netA > 0 and netB > 0:
-            _perf_a = (valA / netA - 1.0) * 100.0
-            _perf_b = (valB / netB - 1.0) * 100.0
-            _gain_a = valA - netA
-            _gain_b = valB - netB
-            _manque = _gain_b - _gain_a
-            with st.container(border=True):
-                st.markdown("#### 📊 Ce que ces chiffres signifient concrètement")
-                _st_c1, _st_c2 = st.columns(2)
-                with _st_c1:
-                    st.metric(
-                        "Votre rendement sur la période",
-                        f"{_perf_a:+.2f}%",
-                        help="Performance totale nette des frais contrat",
-                    )
-                    st.metric(
-                        "Vous avez gagné",
-                        to_eur(_gain_a),
-                        help="Valeur actuelle − versements nets investis",
-                    )
-                with _st_c2:
-                    st.metric(
-                        "Rendement de la proposition cabinet",
-                        f"{_perf_b:+.2f}%",
-                        delta=f"{(_perf_b - _perf_a):+.2f} pts vs votre situation actuelle",
-                    )
-                    st.metric(
-                        "Avec le cabinet, vous auriez gagné",
-                        to_eur(_gain_b),
-                        delta=to_eur(_manque),
-                        help="Manque à gagner par rapport à la proposition",
-                    )
-                if _manque > 0:
-                    st.info(
-                        f"💡 La proposition du cabinet aurait généré "
-                        f"**{to_eur(_manque)} de plus** sur la même période "
-                        f"et le même capital investi."
-                    )
-        elif mode == "client" and netA > 0:
-            _perf_a = (valA / netA - 1.0) * 100.0
-            _gain_a = valA - netA
-            with st.container(border=True):
-                st.markdown("#### 📊 Ce que ces chiffres signifient concrètement")
-                _st_c1, _st_c2 = st.columns(2)
-                with _st_c1:
-                    st.metric("Votre rendement sur la période",
-                               f"{_perf_a:+.2f}%")
-                with _st_c2:
-                    st.metric("Vous avez gagné", to_eur(_gain_a))
-        elif mode == "valority" and netB > 0:
-            _perf_b = (valB / netB - 1.0) * 100.0
-            _gain_b = valB - netB
-            with st.container(border=True):
-                st.markdown("#### 📊 Ce que ces chiffres signifient concrètement")
-                _st_c1, _st_c2 = st.columns(2)
-                with _st_c1:
-                    st.metric("Rendement de la simulation",
-                               f"{_perf_b:+.2f}%")
-                with _st_c2:
-                    st.metric("Capital créé", to_eur(_gain_b))
-
     # ------------------------------------------------------------
     # Synthèse chiffrée : cartes Client / Cabinet
     # ------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("💡 Synthèse")
+    st.subheader("Synthèse chiffrée")
 
     mode = st.session_state.get("MODE_ANALYSE", "compare")
 
@@ -4698,15 +4019,24 @@ def render_app(run_page_config: bool = True):
             with st.container(border=True):
                 st.markdown("#### 🧍 Situation actuelle — Client")
                 st.metric("Valeur actuelle", to_eur(valA))
-                if _nom := st.session_state.get("NOM_CLIENT", "").strip():
-                    st.caption(f"Client : {_nom}")
-                _s_c1, _s_c2 = st.columns(2)
-                with _s_c1:
-                    st.metric("Net investi", to_eur(netA),
-                              help="Versements bruts − frais d'entrée")
-                with _s_c2:
-                    st.metric("Performance totale",
-                              f"{perf_tot_client:+.2f}%" if perf_tot_client is not None else "—")
+                st.markdown(
+                    f"""
+- Montants réellement investis (après frais) : **{to_eur(netA)}**
+- Montants versés (brut) : {to_eur(brutA)}
+- Rendement total depuis le début : **{perf_tot_client:.2f}%**
+"""
+                    if perf_tot_client is not None
+                    else f"""
+- Montants réellement investis (après frais) : **{to_eur(netA)}**
+- Montants versés (brut) : {to_eur(brutA)}
+- Rendement total depuis le début : **—**
+"""
+                )
+                st.markdown(
+                    f"- Rendement annualisé (XIRR) : **{xirrA:.2f}%**"
+                    if xirrA is not None
+                    else "- Rendement annualisé (XIRR) : **—**"
+                )
                 _fee_detail_A = []
                 for _ln in st.session_state.get("A_lines", []):
                     _isin = str(_ln.get("isin", "")).upper()
@@ -4750,13 +4080,24 @@ def render_app(run_page_config: bool = True):
             with st.container(border=True):
                 st.markdown("#### 🏢 Simulation — Allocation Cabinet")
                 st.metric("Valeur actuelle simulée", to_eur(valB))
-                _s_c1b, _s_c2b = st.columns(2)
-                with _s_c1b:
-                    st.metric("Net investi", to_eur(netB),
-                              help="Versements bruts − frais d'entrée")
-                with _s_c2b:
-                    st.metric("Performance totale",
-                              f"{perf_tot_valority:+.2f}%" if perf_tot_valority is not None else "—")
+                st.markdown(
+                    f"""
+- Montants réellement investis (après frais) : **{to_eur(netB)}**
+- Montants versés (brut) : {to_eur(brutB)}
+- Rendement total depuis le début : **{perf_tot_valority:.2f}%**
+"""
+                    if perf_tot_valority is not None
+                    else f"""
+- Montants réellement investis (après frais) : **{to_eur(netB)}**
+- Montants versés (brut) : {to_eur(brutB)}
+- Rendement total depuis le début : **—**
+"""
+                )
+                st.markdown(
+                    f"- Rendement annualisé (XIRR) : **{xirrB:.2f}%**"
+                    if xirrB is not None
+                    else "- Rendement annualisé (XIRR) : **—**"
+                )
                 _fee_detail_B = []
                 for _ln in st.session_state.get("B_lines", []):
                     _isin = str(_ln.get("isin", "")).upper()
@@ -4932,6 +4273,130 @@ def render_app(run_page_config: bool = True):
 {html_A_val}
 """
 
+        # ── Section analyse fondamentale ────────────────────────────────────
+        fa_html = ""
+        _fa = report.get("fa_result")
+        if _fa and not _fa.get("error"):
+            _FA_ALLOC_LBL = {
+                "AssetAllocEquity": "Actions",
+                "AssetAllocBond": "Obligations",
+                "AssetAllocCash": "Cash",
+                "AssetAllocOther": "Autres",
+                "AssetAllocNotClassified": "Non classifié",
+            }
+            _FA_GEO_LBL = {
+                "northAmerica": "Amérique du Nord",
+                "europeDeveloped": "Europe développée",
+                "asiaDeveloped": "Asie développée",
+                "asiaEmerging": "Asie émergente",
+                "japan": "Japon",
+                "latinAmerica": "Amérique latine",
+                "unitedKingdom": "Royaume-Uni",
+                "europeEmerging": "Europe émergente",
+                "africaMiddleEast": "Afrique / Moyen-Orient",
+                "australasia": "Australasie",
+            }
+
+            # Couverture
+            _cov = _fa.get("covered_pct", 0.0)
+            _nf = _fa.get("not_found", [])
+            _nf_str = (
+                " — Fonds non couverts : "
+                + ", ".join(
+                    f"{d.get('name', '—')} ({d.get('isin', '—')})" for d in _nf
+                )
+            ) if _nf else ""
+
+            # Allocation
+            _alloc = _fa.get("allocation") or {}
+            _alloc_rows = "".join(
+                f"<tr><td>{_FA_ALLOC_LBL.get(k, k)}</td><td>{v:.1f}%</td></tr>"
+                for k, v in _alloc.items()
+                if v > 0.5
+            )
+            _alloc_table = (
+                f"<table><tr><th>Classe d'actif</th><th>Poids</th></tr>"
+                f"{_alloc_rows}</table>"
+            ) if _alloc_rows else "<p>Données non disponibles.</p>"
+
+            # Géographie top 8
+            _geo = _fa.get("geography") or {}
+            _geo_sorted = sorted(
+                [(k, v) for k, v in _geo.items() if v > 0.5],
+                key=lambda x: x[1],
+                reverse=True,
+            )[:8]
+            _geo_rows = "".join(
+                f"<tr><td>{_FA_GEO_LBL.get(k, k)}</td><td>{v:.1f}%</td></tr>"
+                for k, v in _geo_sorted
+            )
+            _geo_table = (
+                f"<table><tr><th>Zone</th><th>Poids</th></tr>"
+                f"{_geo_rows}</table>"
+            ) if _geo_rows else ""
+
+            # Secteurs actions top 8
+            _sec_eq = _fa.get("sectors_equity") or {}
+            _sec_eq_sorted = sorted(_sec_eq.items(), key=lambda x: x[1], reverse=True)[:8]
+            _sec_eq_rows = "".join(
+                f"<tr><td>{k}</td><td>{v:.1f}%</td></tr>"
+                for k, v in _sec_eq_sorted
+            )
+            _sec_eq_table = (
+                f"<table><tr><th>Secteur</th><th>Poids</th></tr>"
+                f"{_sec_eq_rows}</table>"
+            ) if _sec_eq_rows else ""
+
+            # Top 10 holdings
+            _holdings = (_fa.get("top_holdings") or [])[:10]
+            _hold_rows = "".join(
+                f"<tr><td>{h.get('name', '—')[:40]}</td>"
+                f"<td>{h.get('isin', '—')}</td>"
+                f"<td>{h['weight_portfolio'] * 100:.2f}%</td>"
+                f"<td>{h.get('country', '—')}</td>"
+                f"<td>{h.get('sector', '—')[:25] if h.get('sector') else '—'}</td></tr>"
+                for h in _holdings
+            )
+            _hold_table = (
+                f"<table><tr><th>Titre</th><th>ISIN</th>"
+                f"<th>Poids %</th><th>Pays</th><th>Secteur</th></tr>"
+                f"{_hold_rows}</table>"
+            ) if _hold_rows else ""
+
+            # ESG
+            _esg = _fa.get("esg_score")
+            _esg_html = ""
+            if _esg is not None:
+                _esg_cat = (
+                    "Négligeable" if _esg <= 10
+                    else "Faible" if _esg <= 20
+                    else "Moyen" if _esg <= 30
+                    else "Élevé" if _esg <= 40
+                    else "Sévère"
+                )
+                _esg_html = (
+                    f"<h3>Score ESG agrégé (Morningstar Sustainalytics)</h3>"
+                    f"<p>Score moyen pondéré : <b>{_esg:.1f}</b> — "
+                    f"Catégorie : <b>{_esg_cat}</b></p>"
+                )
+
+            fa_html = f"""
+<h2>4. Analyse fondamentale des sous-jacents</h2>
+<p class="small">
+  Couverture Morningstar : <b>{_cov:.0f}%</b> du portefeuille. Données pondérées par la valeur
+  actuelle de chaque fonds. Fonds euros et produits structurés exclus.{_nf_str}
+</p>
+<h3>Allocation d'actifs consolidée</h3>
+{_alloc_table}
+<h3>Répartition géographique (top 8)</h3>
+{_geo_table}
+<h3>Secteurs actions (top 8)</h3>
+{_sec_eq_table}
+<h3>Top 10 positions consolidées</h3>
+{_hold_table}
+{_esg_html}
+"""
+
         html = f"""
 <!DOCTYPE html>
 <html lang="fr">
@@ -4984,6 +4449,7 @@ th {{
 {synth_html}
 {detail_html}
 {hist_html}
+{fa_html}
 
 <p class="small">
 Ce document est fourni à titre informatif uniquement et ne constitue pas un conseil en investissement
@@ -5050,33 +4516,20 @@ personnalisé.
             return None
         if not df_map:
             return None
-        plt.rcParams["font.family"] = "DejaVu Sans"
-        _CHART_COLORS = ["#1F3B6D", "#C8963E"]
         fig, ax = plt.subplots(figsize=(6, 3))
-        fig.patch.set_facecolor("white")
         has_data = False
-        for idx, (label, df) in enumerate(df_map.items()):
+        for label, df in df_map.items():
             if df is None or df.empty or "Valeur" not in df.columns:
                 continue
-            ax.plot(
-                df.index, df["Valeur"],
-                label=label,
-                color=_CHART_COLORS[idx % len(_CHART_COLORS)],
-                linewidth=1.8,
-            )
+            ax.plot(df.index, df["Valeur"], label=label)
             has_data = True
         if not has_data:
             plt.close(fig)
             return None
-        from matplotlib.ticker import FuncFormatter
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:,.0f}".replace(",", " ")))
         ax.set_title("Évolution de la valeur du portefeuille")
         ax.set_xlabel("Date")
         ax.set_ylabel("Valeur (€)")
         ax.legend(loc="best")
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.grid(axis="y", color="#E2E8F0", linewidth=0.5)
         fig.autofmt_xdate()
         return _fig_to_rl_image(fig)
 
@@ -5133,16 +4586,11 @@ personnalisé.
     ) -> Optional[Image]:
         if not MATPLOTLIB_AVAILABLE or df_alloc.empty:
             return None
-        plt.rcParams["font.family"] = "DejaVu Sans"
-        _DONUT_COLORS = ["#1F3B6D", "#C8963E", "#1A7A4A", "#F1F4F9", "#2E5FA3",
-                         "#4B5563", "#6B7280", "#9CA3AF"]
         fig, ax = plt.subplots(figsize=figsize)
-        fig.patch.set_facecolor("white")
         wedges, _ = ax.pie(
             df_alloc["Poids"],
             startangle=90,
             labels=None,
-            colors=_DONUT_COLORS[:len(df_alloc)],
             wedgeprops=dict(width=0.35, edgecolor="white"),
         )
         labels = [
@@ -5209,20 +4657,15 @@ personnalisé.
         df = df_positions.copy()
         if not {"Nom", "Valeur actuelle €", "Net investi €"}.issubset(df.columns):
             return None
-        plt.rcParams["font.family"] = "DejaVu Sans"
         df["Contribution €"] = df["Valeur actuelle €"] - df["Net investi €"]
         df = df.sort_values("Contribution €", ascending=False)
-        bar_colors = ["#1A7A4A" if v >= 0 else "#CC2200" for v in df["Contribution €"]]
         fig_height = max(2.0, min(4.2, 0.35 * len(df) + 1.2))
         fig, ax = plt.subplots(figsize=(6.2, fig_height))
-        fig.patch.set_facecolor("white")
-        ax.barh(df["Nom"], df["Contribution €"], color=bar_colors)
+        ax.barh(df["Nom"], df["Contribution €"], color="#2F6F9F")
         ax.invert_yaxis()
         ax.set_title("Contribution à la performance (€)")
         ax.axvline(0, color="black", linewidth=0.5)
         ax.tick_params(axis="y", labelsize=8)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
         for i, v in enumerate(df["Contribution €"]):
             offset = 0.01 * abs(v) if v != 0 else 0.5
             x_pos = v + offset if v >= 0 else v - offset
@@ -5275,14 +4718,10 @@ personnalisé.
                 width, height = A4
                 self.setFillColor(colors.HexColor("#1F3B6D"))
                 self.setFont("Helvetica-Bold", 10)
-                header_text = report.get("nom_cabinet", "") or "Rapport de portefeuille"
-                self.drawString(36, height - 30, header_text)
+                self.drawString(36, height - 30, "Rapport de portefeuille – Cabinet")
                 self.setFillColor(colors.grey)
                 self.setFont("Helvetica", 8)
-                as_of_str = report.get("as_of", "")
-                nom_cli_str = report.get("nom_client", "").strip()
-                right_str = f"{nom_cli_str}  ·  {as_of_str}" if nom_cli_str else as_of_str
-                self.drawRightString(width - 36, height - 30, right_str)
+                self.drawRightString(width - 36, height - 30, report.get("as_of", ""))
                 self.setFillColor(colors.grey)
                 self.setFont("Helvetica", 7)
                 self.drawString(
@@ -5360,15 +4799,6 @@ personnalisé.
             return table
 
         story.append(Paragraph("Rapport client", styles["title"]))
-        _cover_nom_cli = report.get("nom_client", "").strip()
-        _cover_nom_cab = report.get("nom_cabinet", "").strip()
-        if _cover_nom_cli or _cover_nom_cab:
-            _cover_parts = []
-            if _cover_nom_cli:
-                _cover_parts.append(f"Client : {_cover_nom_cli}")
-            if _cover_nom_cab:
-                _cover_parts.append(f"Cabinet : {_cover_nom_cab}")
-            story.append(Paragraph("  ·  ".join(_cover_parts), styles["small"]))
         story.append(Paragraph(f"Date de génération : {report.get('as_of', '')}", styles["small"]))
         story.append(Spacer(1, 12))
 
@@ -5431,110 +4861,13 @@ personnalisé.
             if fees:
                 story.append(Spacer(1, 8))
                 fees_rows = [
-                    ("Frais d'entrée payés", fmt_eur_fr(fees.get("fees_paid", 0))),
+                    ("Frais d’entrée payés", fmt_eur_fr(fees.get("fees_paid", 0))),
                     ("Valeur créée", fmt_eur_fr(fees.get("value_created", 0))),
                     ("Valeur/an", fmt_eur_fr(fees.get("value_per_year", 0))),
                 ]
                 story.append(_kpi_table("Frais & valeur créée", fees_rows))
 
         story.append(Spacer(1, 12))
-
-        # ---- Diversification & Indicateurs de risque ----
-        def _fmt_ratio(v, decimals=2):
-            if v is None:
-                return "—"
-            return f"{v:.{decimals}f}"
-
-        def _div_label_pdf(score):
-            if score >= 70:
-                return "Bonne diversification"
-            elif score >= 40:
-                return "Diversification moyenne"
-            return "Fausse diversification"
-
-        div_A = report.get("diversification_A")
-        div_B = report.get("diversification_B")
-        risk_pdf_A = report.get("risk_A")
-        risk_pdf_B = report.get("risk_B")
-        has_div = div_A is not None or div_B is not None
-
-        if has_div:
-            story.append(Paragraph("Diversification du portefeuille", styles["h1"]))
-
-            def _div_rows(div_res, risk_res, port_val):
-                rows = []
-                if div_res:
-                    rows.append(("Score de diversification", f"{div_res['score']:.0f}/100 — {_div_label_pdf(div_res['score'])}"))
-                    rows.append(("Corrélation moyenne", f"{div_res['avg_corr']:.0%}"))
-                    rows.append(("Nb lignes analysées", str(div_res["n_lines"])))
-                    if div_res["doublons"]:
-                        pairs = ", ".join(f"{a}/{b}" for a, b, _ in div_res["doublons"])
-                        rows.append(("Doublons détectés", pairs))
-                if risk_res:
-                    rows.append(("Volatilité annuelle", f"{risk_res['vol_ann_pct']:.1f}%"))
-                    rows.append(("Max drawdown", f"{risk_res['max_dd_pct']:.1f}%"))
-                return rows
-
-            if mode == "compare":
-                _val_A = report.get("client_summary", {}).get("val", 0)
-                _val_B = report.get("valority_summary", {}).get("val", 0)
-                _div_tbl = Table(
-                    [[
-                        _kpi_table("Client", _div_rows(div_A, risk_pdf_A, _val_A)),
-                        _kpi_table("Cabinet", _div_rows(div_B, risk_pdf_B, _val_B)),
-                    ]],
-                    colWidths=[240, 240],
-                )
-                story.append(_div_tbl)
-            else:
-                _d = div_B if mode == "valority" else div_A
-                _r = risk_pdf_B if mode == "valority" else risk_pdf_A
-                _lbl = "Cabinet" if mode == "valority" else "Client"
-                if _d or _r:
-                    story.append(_kpi_table(_lbl, _div_rows(_d, _r, None)))
-
-            story.append(Spacer(1, 8))
-
-        # ---- Ratios techniques ----
-        ratios_A = report.get("ratios_A", {})
-        ratios_B = report.get("ratios_B", {})
-        has_ratios = any(ratios_A.get(k) is not None for k in ("sharpe", "sortino", "beta_alpha")) or \
-                     any(ratios_B.get(k) is not None for k in ("sharpe", "sortino", "beta_alpha"))
-        if has_ratios:
-            story.append(Paragraph("Ratios techniques", styles["h1"] if not has_div else styles["h2"]))
-            if mode == "compare":
-                def _ratio_rows(rat):
-                    ba = rat.get("beta_alpha") or {}
-                    return [
-                        ("Ratio de Sharpe", _fmt_ratio(rat.get("sharpe"))),
-                        ("Ratio de Sortino", _fmt_ratio(rat.get("sortino"))),
-                        ("Bêta", _fmt_ratio(ba.get("beta"))),
-                        ("Alpha (%/an)", _fmt_ratio(ba.get("alpha_pct"), 2)),
-                    ]
-                _rt = Table(
-                    [[_kpi_table("Client", _ratio_rows(ratios_A)), _kpi_table("Cabinet", _ratio_rows(ratios_B))]],
-                    colWidths=[240, 240],
-                )
-                story.append(_rt)
-            else:
-                rat = ratios_B if mode == "valority" else ratios_A
-                ba = rat.get("beta_alpha") or {}
-                bench_name = ba.get("benchmark_name", "")
-                ratio_rows_single = [
-                    ("Ratio de Sharpe", _fmt_ratio(rat.get("sharpe"))),
-                    ("Ratio de Sortino", _fmt_ratio(rat.get("sortino"))),
-                    (f"Beta{' vs ' + bench_name if bench_name else ''}", _fmt_ratio(ba.get("beta"))),
-                    ("Alpha (%/an)", _fmt_ratio(ba.get("alpha_pct"), 2)),
-                ]
-                story.append(_kpi_table("Ratios de risque", ratio_rows_single))
-            story.append(Paragraph(
-                "Sharpe = (rendement annualisé – taux sans risque) / volatilité. "
-                "Sortino = idem avec volatilité à la baisse uniquement. "
-                "Beta = sensibilité relative au marché de référence.",
-                styles["small"],
-            ))
-            story.append(Spacer(1, 12))
-
         story.append(Paragraph("Graphiques", styles["h1"]))
 
         value_chart = _build_value_chart(report.get("df_map", {}))
@@ -5663,704 +4996,173 @@ personnalisé.
                 report.get("lines", []),
             )
 
+        # ── Page Analyse fondamentale (si disponible) ─────────────────
+        # FIXED (P1): lire depuis report (passé explicitement) avec fallback session_state
+        _fa_result = report.get("fa_result") or st.session_state.get("FUND_ANALYSIS_RESULT")
+        if _fa_result and not _fa_result.get("error"):
+            try:
+                story.append(PageBreak())
+                story.append(Paragraph("Analyse fondamentale des sous-jacents", styles["h1"]))
+
+                # Bandeau couverture
+                _fa_cov = _fa_result.get("covered_pct", 0.0)
+                story.append(
+                    Paragraph(
+                        f"Couverture Morningstar : {_fa_cov:.0f}% du portefeuille analysé. "
+                        "Données pondérées par la valeur actuelle de chaque fonds. "
+                        "Fonds euros et produits structurés exclus.",
+                        styles["small"],
+                    )
+                )
+                _fa_not_found = _fa_result.get("not_found", [])
+                if _fa_not_found:
+                    _nf_str = ", ".join(
+                        f"{d.get('name','—')} ({d.get('isin','—')})"
+                        for d in _fa_not_found
+                    )
+                    story.append(
+                        Paragraph(f"Fonds non couverts : {_nf_str}", styles["small"])
+                    )
+                story.append(Spacer(1, 8))
+
+                # Tableau allocation d'actifs
+                _fa_alloc = _fa_result.get("allocation") or {}
+                if _fa_alloc:
+                    story.append(Paragraph("Allocation d'actifs consolidée", styles["h2"]))
+                    _FA_ALLOC_LBL = {
+                        "AssetAllocEquity":        "Actions",
+                        "AssetAllocBond":          "Obligations",
+                        "AssetAllocCash":          "Cash",
+                        "AssetAllocOther":         "Autres",
+                        "AssetAllocNotClassified": "Non classifié",
+                    }
+                    _alloc_rows = [
+                        [_FA_ALLOC_LBL.get(k, k), f"{v:.1f}%"]
+                        for k, v in _fa_alloc.items() if v > 0.5
+                    ]
+                    if _alloc_rows:
+                        _add_table_to_story(
+                            story,
+                            pd.DataFrame(_alloc_rows, columns=["Classe d'actif", "Poids (%)"]),
+                            col_widths=[200, 80],
+                            font_size=9,
+                        )
+                        # FIXED (P3): note si somme < 95%
+                        try:
+                            _alloc_total_pdf = sum(
+                                float(v.rstrip("%")) for _, v in _alloc_rows
+                            )
+                        except Exception:
+                            _alloc_total_pdf = 100.0
+                        if _alloc_total_pdf < 95.0:
+                            story.append(Paragraph(
+                                f"Note : total affiché {_alloc_total_pdf:.1f}% (expositions "
+                                "nettes Morningstar, dérivés exclus).",
+                                styles["small"],
+                            ))
+                    story.append(Spacer(1, 8))
+
+                # Tableau géographie top 8
+                _fa_geo = _fa_result.get("geography") or {}
+                if _fa_geo:
+                    story.append(Paragraph("Répartition géographique (top 8 zones)", styles["h2"]))
+                    _FA_GEO_LBL = {
+                        "northAmerica":     "Amérique du Nord",
+                        "europeDeveloped":  "Europe développée",
+                        "asiaDeveloped":    "Asie développée",
+                        "asiaEmerging":     "Asie émergente",
+                        "japan":            "Japon",
+                        "latinAmerica":     "Amérique latine",
+                        "unitedKingdom":    "Royaume-Uni",
+                        "europeEmerging":   "Europe émergente",
+                        "africaMiddleEast": "Afrique / Moyen-Orient",
+                        "australasia":      "Australasie",
+                    }
+                    _geo_sorted = sorted(
+                        [(k, v) for k, v in _fa_geo.items() if v > 0.5],
+                        key=lambda x: x[1], reverse=True,
+                    )[:8]
+                    if _geo_sorted:
+                        _add_table_to_story(
+                            story,
+                            pd.DataFrame(
+                                [[_FA_GEO_LBL.get(k, k), f"{v:.1f}%"] for k, v in _geo_sorted],
+                                columns=["Zone géographique", "Poids (%)"],
+                            ),
+                            col_widths=[200, 80],
+                            font_size=9,
+                        )
+                    story.append(Spacer(1, 8))
+
+                # Tableau secteurs actions top 8
+                _fa_sec_eq = _fa_result.get("sectors_equity") or {}
+                if _fa_sec_eq:
+                    story.append(Paragraph("Secteurs actions (top 8)", styles["h2"]))
+                    _fa_sec_eq_sorted = sorted(
+                        _fa_sec_eq.items(), key=lambda x: x[1], reverse=True
+                    )[:8]
+                    _add_table_to_story(
+                        story,
+                        pd.DataFrame(
+                            [[_FS_SECTOR_LABELS.get(k, k), f"{v:.1f}%"] for k, v in _fa_sec_eq_sorted],
+                            columns=["Secteur", "Poids (%)"],
+                        ),
+                        col_widths=[200, 80],
+                        font_size=9,
+                    )
+                    story.append(Spacer(1, 8))
+
+                # Tableau top 10 holdings consolidés
+                _fa_top_h = _fa_result.get("top_holdings") or []
+                if _fa_top_h:
+                    story.append(Paragraph("Top 10 positions consolidées", styles["h2"]))
+                    _h_rows = [
+                        [
+                            h.get("name", "—")[:40],
+                            h.get("isin", "—"),
+                            f"{h['weight_portfolio'] * 100:.2f}%",
+                            h.get("country", "—"),
+                            h.get("sector", "—")[:20] if h.get("sector") else "—",
+                        ]
+                        for h in _fa_top_h[:10]
+                    ]
+                    _add_table_to_story(
+                        story,
+                        pd.DataFrame(
+                            _h_rows,
+                            columns=["Titre", "ISIN", "Poids %", "Pays", "Secteur"],
+                        ),
+                        col_widths=[160, 85, 50, 50, 80],
+                        font_size=8,
+                    )
+                    story.append(Spacer(1, 8))
+
+                # Score ESG
+                _fa_esg = _fa_result.get("esg_score")
+                if _fa_esg is not None:
+                    if _fa_esg <= 10:
+                        _fa_esg_cat = "Négligeable"
+                    elif _fa_esg <= 20:
+                        _fa_esg_cat = "Faible"
+                    elif _fa_esg <= 30:
+                        _fa_esg_cat = "Moyen"
+                    elif _fa_esg <= 40:
+                        _fa_esg_cat = "Élevé"
+                    else:
+                        _fa_esg_cat = "Sévère"
+                    story.append(Paragraph("Score ESG agrégé (Morningstar Sustainalytics)", styles["h2"]))
+                    story.append(
+                        Paragraph(
+                            f"Score moyen pondéré : {_fa_esg:.1f} — Catégorie : {_fa_esg_cat}",
+                            styles["kpi"],
+                        )
+                    )
+            except Exception:
+                pass
+
         doc.build(story, canvasmaker=NumberedCanvas)
         buffer.seek(0)
         return buffer.read()
-
-
-    def _chart_to_pptx_image(
-        df: pd.DataFrame,
-        col_y: str,
-        label: str,
-        color: str = "#1B2A4A",
-    ) -> Optional[bytes]:
-        """
-        Génère un graphique matplotlib en mémoire (PNG bytes)
-        pour insertion dans le PPTX.
-        df doit avoir un DatetimeIndex ou colonne Date.
-        """
-        if not MATPLOTLIB_AVAILABLE or df is None or df.empty:
-            return None
-        try:
-            import io as _io
-            _fig, _ax = plt.subplots(figsize=(7, 2.8))
-            _ax.fill_between(
-                df.index if hasattr(df.index, "dtype") and "datetime" in str(df.index.dtype)
-                else range(len(df)),
-                df[col_y].ffill(),
-                alpha=0.18,
-                color=color,
-            )
-            _ax.plot(
-                df.index if hasattr(df.index, "dtype") and "datetime" in str(df.index.dtype)
-                else range(len(df)),
-                df[col_y].ffill(),
-                color=color,
-                linewidth=1.8,
-            )
-            _ax.set_ylabel("€", fontsize=8)
-            _ax.set_title(label, fontsize=9, color="#1B2A4A", fontweight="bold")
-            _ax.spines["top"].set_visible(False)
-            _ax.spines["right"].set_visible(False)
-            _ax.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
-            )
-            _fig.tight_layout()
-            _buf = _io.BytesIO()
-            _fig.savefig(_buf, format="png", dpi=130, bbox_inches="tight")
-            plt.close(_fig)
-            _buf.seek(0)
-            return _buf.read()
-        except Exception:
-            return None
-
-    def generate_pptx_report(report: Dict[str, Any]) -> bytes:
-        """Génère une présentation 16:9 de 5 slides pour le client."""
-        if not PPTX_AVAILABLE:
-            raise RuntimeError(f"PPTX indisponible: {PPTX_ERROR}")
-
-        # ── Palette ──────────────────────────────────────────────────────────
-        NAVY   = RGBColor(0x1F, 0x3B, 0x6D)
-        GOLD   = RGBColor(0xC8, 0x96, 0x3E)
-        ICE    = RGBColor(0xE8, 0xEE, 0xF7)
-        GREEN  = RGBColor(0x1A, 0x7A, 0x4A)
-        GREY   = RGBColor(0x64, 0x74, 0x8B)
-        WHITE  = RGBColor(0xFF, 0xFF, 0xFF)
-        LGREY  = RGBColor(0xF1, 0xF4, 0xF9)
-        BORDER = RGBColor(0xD1, 0xD9, 0xE6)
-        BLUE   = RGBColor(0x2E, 0x5F, 0xA3)
-        BLACK  = RGBColor(0x11, 0x18, 0x27)
-
-        # ── Données du rapport ────────────────────────────────────────────────
-        nom_cab  = report.get("nom_cabinet", "") or "Votre cabinet"
-        nom_cli  = report.get("nom_client", "") or ""
-        as_of    = report.get("as_of", "")
-        contrat  = report.get("contrat_label", "Assurance-vie") or "Assurance-vie"
-        date_ouv = report.get("date_ouverture", "")
-        mode     = report.get("mode", "compare")
-
-        synthA  = report.get("client_summary", {})
-        synthB  = report.get("valority_summary", {})
-        comp    = report.get("comparison", {})
-
-        # Synthèse principale selon le mode
-        if mode == "valority":
-            synth_main = synthB
-            _raw_df = report.get("positions_df_valority")
-            positions_df_main = _raw_df if isinstance(_raw_df, pd.DataFrame) else pd.DataFrame()
-        else:
-            synth_main = synthA
-            _raw_df = report.get("positions_df_client")
-            positions_df_main = _raw_df if isinstance(_raw_df, pd.DataFrame) else pd.DataFrame()
-
-        val  = synth_main.get("val", 0.0)
-        net  = synth_main.get("net", 0.0)
-        brut = synth_main.get("brut", 0.0)
-        perf = synth_main.get("perf_tot_pct", 0.0)
-        xirr_val = synth_main.get("irr_pct", 0.0)
-        # Guard : si val = 0, utiliser valB ou valA selon disponibilité
-        if val == 0.0 and mode == "compare":
-            val  = report.get("valority_summary", {}).get("val", 0.0) or \
-                   report.get("client_summary", {}).get("val", 0.0)
-            net  = report.get("valority_summary", {}).get("net", 0.0) or \
-                   report.get("client_summary", {}).get("net", 0.0)
-            brut = report.get("valority_summary", {}).get("brut", 0.0) or \
-                   report.get("client_summary", {}).get("brut", 0.0)
-
-        def _fe(x: Any) -> str:
-            try:
-                return f"{float(x):,.0f} €".replace(",", " ")
-            except Exception:
-                return "— €"
-
-        def _fp(x: Any) -> str:
-            try:
-                return f"{float(x):+.2f}%"
-            except Exception:
-                return "—%"
-
-        # ── Helpers ──────────────────────────────────────────────────────────
-        def _add_rect(slide, l: float, t: float, w: float, h: float,
-                      fill_rgb: RGBColor, line_rgb: Optional[RGBColor] = None):
-            shape = slide.shapes.add_shape(
-                1,  # MSO_SHAPE_TYPE RECTANGLE
-                Inches(l), Inches(t), Inches(w), Inches(h),
-            )
-            shape.fill.solid()
-            shape.fill.fore_color.rgb = fill_rgb
-            if line_rgb is None:
-                shape.line.fill.background()
-            else:
-                shape.line.color.rgb = line_rgb
-            return shape
-
-        def _add_text(slide, text: str, l: float, t: float, w: float, h: float,
-                      size: float, color: RGBColor, bold: bool = False,
-                      align: str = "left", italic: bool = False) -> None:
-            txBox = slide.shapes.add_textbox(Inches(l), Inches(t), Inches(w), Inches(h))
-            tf = txBox.text_frame
-            tf.word_wrap = True
-            p = tf.paragraphs[0]
-            p.text = text
-            p.font.size = Pt(size)
-            p.font.color.rgb = color
-            p.font.bold = bold
-            p.font.italic = italic
-            p.alignment = PP_ALIGN.CENTER if align == "center" else PP_ALIGN.RIGHT if align == "right" else PP_ALIGN.LEFT
-
-        def _footer(slide):
-            parts = [nom_cab]
-            if nom_cli:
-                parts.append(f"Document pour {nom_cli}")
-            if as_of:
-                parts.append(as_of)
-            _add_text(slide, "  ·  ".join(parts),
-                      0.28, 5.38, 9.44, 0.20, 7, GREY, align="center")
-
-        def _left_stripe(slide, color: RGBColor = NAVY):
-            _add_rect(slide, 0, 0, 0.18, 5.625, color)
-
-        # ── Présentation ──────────────────────────────────────────────────────
-        from pptx import Presentation as _Prs
-        from pptx.util import Inches as _In, Pt as _Pt, Emu as _Emu
-
-        prs = _Prs()
-        prs.slide_width  = _In(10)
-        prs.slide_height = _In(5.625)
-
-        blank_layout = prs.slide_layouts[6]  # blank layout
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 1 — Page de garde
-        # ══════════════════════════════════════════════════════════════════════
-        s1 = prs.slides.add_slide(blank_layout)
-        _add_rect(s1, 0, 0, 10, 5.625, NAVY)          # fond navy
-        _add_rect(s1, 0, 0, 0.18, 5.625, GOLD)         # bande gauche or
-        _add_rect(s1, 0.55, 0.70, 8.80, 2.00, LGREY)   # bandeau clair
-
-        _add_text(s1, nom_cab.upper(),
-                  0.55, 0.80, 8.80, 0.32, 9, GOLD, bold=False, align="center")
-        if mode == "client":
-            _titre_s1 = f"Audit Patrimonial"
-            _sous_titre_s1 = f"Situation actuelle de {nom_cli}" if nom_cli else "Situation actuelle"
-        elif mode == "valority":
-            _titre_s1 = f"Proposition d'Investissement"
-            _sous_titre_s1 = f"Une stratégie élaborée par {nom_cab}" if nom_cab else "Stratégie conseiller"
-        else:  # compare
-            _titre_s1 = f"Synthèse d'Arbitrage"
-            _sous_titre_s1 = f"Audit & Recommandation {nom_cab}" if nom_cab else "Comparatif complet"
-        _add_text(s1, _titre_s1,
-                  0.55, 1.00, 8.80, 0.55, 28, NAVY, bold=True, align="center")
-        _add_text(s1, _sous_titre_s1,
-                  0.55, 1.58, 8.80, 0.32, 13, GREY, align="center")
-
-        # séparateur or
-        _add_rect(s1, 3.20, 2.80, 3.60, 0.04, GOLD)
-
-        # Nom client
-        _add_text(s1, nom_cli if nom_cli else "—",
-                  0.55, 2.95, 8.80, 0.42, 20, WHITE, bold=True, align="center")
-        # Contrat
-        _add_text(s1, contrat,
-                  0.55, 3.50, 8.80, 0.28, 9, ICE, align="center")
-        # Dates
-        _dates_str = ""
-        if date_ouv:
-            _dates_str = f"Ouverture : {date_ouv}"
-        if as_of:
-            _dates_str += (f"  ·  Arrêté au : {as_of}" if _dates_str else f"Arrêté au : {as_of}")
-        _add_text(s1, _dates_str,
-                  0.55, 3.80, 8.80, 0.28, 8, GREY, align="center")
-        # Disclaimer
-        _add_text(s1,
-                  "Document à usage interne — Simulation historique. "
-                  "Les performances passées ne préjugent pas des performances futures.",
-                  0.55, 5.20, 8.80, 0.28, 6, GREY, align="center")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 2 — Votre portefeuille aujourd'hui
-        # ══════════════════════════════════════════════════════════════════════
-        s2 = prs.slides.add_slide(blank_layout)
-        _add_rect(s2, 0, 0, 10, 5.625, LGREY)
-        _left_stripe(s2)
-        _footer(s2)
-
-        _add_text(s2, "Votre portefeuille aujourd'hui",
-                  0.30, 0.15, 9.30, 0.55, 20, NAVY, bold=True)
-        _add_text(s2, f"Situation au {as_of}",
-                  0.30, 0.68, 9.30, 0.25, 9, GREY)
-
-        # 4 cartes KPI
-        _kpi_data = [
-            ("Valeur actuelle", _fe(val), f"Versé : {_fe(brut)}", WHITE),
-            ("Capital investi", _fe(net), "Après frais d'entrée", WHITE),
-            ("Performance totale", f"{perf:+.2f}%", "Depuis l'ouverture", GREEN),
-            ("Rendement annualisé", f"{xirr_val:+.2f}%", "XIRR", BLUE),
-        ]
-        _kpi_x = [0.28, 2.58, 4.88, 7.18]
-        for idx, (lbl, val_str, sub_lbl, val_color) in enumerate(_kpi_data):
-            _xk = _kpi_x[idx]
-            _add_rect(s2, _xk, 1.05, 2.20, 1.10, WHITE, BORDER)
-            _add_text(s2, lbl,  _xk + 0.08, 1.10, 2.04, 0.22, 8, GREY)
-            _add_text(s2, val_str, _xk + 0.08, 1.33, 2.04, 0.30, 18, val_color, bold=True)
-            _add_text(s2, sub_lbl, _xk + 0.08, 1.65, 2.04, 0.22, 7, GREY)
-
-        # Bande "Valeur créée"
-        _vc = val - net
-        _fees_paid = max(0.0, brut - net)
-        _add_rect(s2, 0.28, 2.28, 9.10, 0.82, NAVY)
-        _add_text(s2, "Valeur créée pour vous",
-                  0.36, 2.30, 2.50, 0.28, 10, ICE, bold=True)
-        _add_text(s2, _fe(_vc),
-                  0.36, 2.55, 2.50, 0.30, 18, GOLD, bold=True)
-        _fees_note = f"Frais d'entrée payés : {_fe(_fees_paid)}  ·  Performance nette des frais contrat"
-        _add_text(s2, _fees_note, 0.36, 2.90, 9.00, 0.18, 7, ICE)
-
-        # Tableau positions
-        _add_text(s2, "Composition du portefeuille",
-                  0.28, 3.22, 9.10, 0.28, 11, NAVY, bold=True)
-
-        if not positions_df_main.empty:
-            _cols_needed = {"Nom", "ISIN / Code", "Net investi €", "Valeur actuelle €", "Perf %"}
-            _df_tbl = positions_df_main.copy()
-            _row_y = 3.52
-            _col_w = [3.5, 0.85, 1.5, 1.65, 1.0]
-            _col_x = [0.28]
-            for _cw in _col_w[:-1]:
-                _col_x.append(_col_x[-1] + _cw)
-
-            _headers = ["Fonds", "Part %", "Net investi", "Valeur actuelle", "Perf %"]
-            for ci, (_cx, _ch) in enumerate(zip(_col_x, _headers)):
-                _add_rect(s2, _cx, _row_y, _col_w[ci], 0.25, NAVY)
-                _add_text(s2, _ch, _cx + 0.04, _row_y + 0.02, _col_w[ci] - 0.08, 0.22, 9, WHITE, bold=True)
-
-            _total_val_tbl = _df_tbl["Valeur actuelle €"].sum() if "Valeur actuelle €" in _df_tbl.columns else 0.0
-            for ri, row in enumerate(_df_tbl.head(6).itertuples(index=False)):
-                _ry = _row_y + 0.25 + ri * 0.26
-                _row_bg = WHITE if ri % 2 == 0 else LGREY
-                _add_rect(s2, 0.28, _ry, 9.10, 0.26, _row_bg)
-                _nom_tbl = str(getattr(row, "Nom", "—"))[:38]
-                _net_tbl  = float(getattr(row, "Net_investi_€",  getattr(row, "Net investi €", 0)) or 0)
-                _val_tbl  = float(getattr(row, "Valeur_actuelle_€", getattr(row, "Valeur actuelle €", 0)) or 0)
-                _perf_tbl = ((_val_tbl / _net_tbl - 1) * 100) if _net_tbl > 0 else 0.0
-                _part_tbl = (_val_tbl / _total_val_tbl * 100) if _total_val_tbl > 0 else 0.0
-                _perf_color = GREEN if _perf_tbl >= 0 else RGBColor(0xCC, 0x22, 0x00)
-                _row_vals = [_nom_tbl, f"{_part_tbl:.1f}%", _fe(_net_tbl), _fe(_val_tbl), f"{_perf_tbl:+.2f}%"]
-                for ci2, (_cx2, _rv) in enumerate(zip(_col_x, _row_vals)):
-                    _tc = _perf_color if ci2 == 4 else BLACK
-                    _add_text(s2, _rv, _cx2 + 0.04, _ry + 0.03, _col_w[ci2] - 0.08, 0.20, 8, _tc)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 3 — Allocation recommandée (ou analyse simple)
-        # ══════════════════════════════════════════════════════════════════════
-        s3 = prs.slides.add_slide(blank_layout)
-        _add_rect(s3, 0, 0, 10, 5.625, WHITE)
-        _left_stripe(s3)
-        _footer(s3)
-
-        if mode == "compare":
-            val_B  = synthB.get("val", 0.0)
-            net_B  = synthB.get("net", 0.0)
-            perf_B = synthB.get("perf_tot_pct", 0.0)
-            xirr_B = synthB.get("irr_pct", 0.0)
-            delta_val  = comp.get("delta_val", 0.0)
-            delta_perf = comp.get("delta_perf_pct", 0.0)
-            delta_xirr = (xirr_B - synth_main.get("irr_pct", 0.0))
-
-            _add_text(s3, "L'allocation recommandée",
-                      0.30, 0.15, 9.30, 0.55, 20, NAVY, bold=True)
-            _add_text(s3, "Simulation sur la même période avec l'allocation de votre conseiller",
-                      0.30, 0.68, 9.30, 0.25, 9, GREY)
-
-            # Col gauche — 3 cartes KPI verticales
-            _s3_kpis = [
-                ("Valeur simulée", _fe(val_B), "Allocation conseiller", GREEN),
-                ("Performance totale", f"{perf_B:+.2f}%", "Depuis l'ouverture", GREEN),
-                ("Rendement annualisé", f"{xirr_B:+.2f}%", "XIRR", BLUE),
-            ]
-            for ki, (klbl, kval, ksub, kcolor) in enumerate(_s3_kpis):
-                _ky = 1.08 + ki * 1.12
-                _add_rect(s3, 0.28, _ky, 2.85, 1.00, LGREY, BORDER)
-                _add_text(s3, klbl,  0.36, _ky + 0.06, 2.69, 0.22, 8, GREY)
-                _add_text(s3, kval,  0.36, _ky + 0.28, 2.69, 0.32, 18, kcolor, bold=True)
-                _add_text(s3, ksub,  0.36, _ky + 0.65, 2.69, 0.22, 7, GREY)
-
-            # Graphique évolution si disponible
-            _dfA_val = report.get("dfA_val")
-            _dfB_val = report.get("dfB_val")
-            if isinstance(_dfA_val, pd.DataFrame) and not _dfA_val.empty \
-                    and "Valeur" in _dfA_val.columns:
-                _img_bytes = _chart_to_pptx_image(
-                    _dfA_val.set_index("Date") if "Date" in _dfA_val.columns else _dfA_val,
-                    "Valeur", "Évolution — Portefeuille actuel", "#1B2A4A"
-                )
-            elif isinstance(_dfB_val, pd.DataFrame) and not _dfB_val.empty \
-                    and "Valeur" in _dfB_val.columns:
-                _img_bytes = _chart_to_pptx_image(
-                    _dfB_val.set_index("Date") if "Date" in _dfB_val.columns else _dfB_val,
-                    "Valeur", "Évolution — Portefeuille proposé", "#C9A84C"
-                )
-            else:
-                _img_bytes = None
-            if _img_bytes is not None:
-                _img_stream = BytesIO(_img_bytes)
-                s3.shapes.add_picture(
-                    _img_stream,
-                    left=Inches(0.28), top=Inches(1.05),
-                    width=Inches(2.85), height=Inches(2.00),
-                )
-            # Col droite — bloc delta
-            _add_rect(s3, 3.32, 1.00, 6.16, 3.55, ICE, BORDER)
-            _add_text(s3, "Ce que l'allocation recommandée\naurait généré de plus",
-                      3.50, 1.08, 5.80, 0.60, 13, NAVY, bold=True)
-            _delta_sign = "+" if delta_val >= 0 else ""
-            _add_text(s3, f"{_delta_sign}{_fe(delta_val)}",
-                      3.32, 1.72, 6.16, 0.58, 36, GOLD, bold=True, align="center")
-            _add_text(s3, "de valeur supplémentaire",
-                      3.32, 2.28, 6.16, 0.28, 10, GREY, align="center")
-            _add_rect(s3, 3.52, 2.64, 5.76, 0.02, BORDER)
-            # Deux colonnes delta
-            _d_kpis = [
-                (_fp(delta_perf), "de performance en plus"),
-                (_fp(delta_xirr), "de rendement annualisé"),
-            ]
-            for di, (dv, dl) in enumerate(_d_kpis):
-                _dx = 3.52 + di * 3.00
-                _add_text(s3, dv, _dx, 2.75, 2.80, 0.38, 20, GREEN, bold=True, align="center")
-                _add_text(s3, dl, _dx, 3.14, 2.80, 0.25, 9, GREY, align="center")
-
-            _add_text(s3,
-                      "⚠️ Simulation historique. Les performances passées ne préjugent pas des performances futures.",
-                      0.28, 4.72, 9.44, 0.22, 8, GREY)
-        elif mode == "client":
-            # Slide 3 Audit — Points forts / Points de vigilance
-            _add_text(s3, "Audit & Diagnostic de votre portefeuille",
-                      0.30, 0.15, 9.30, 0.55, 20, NAVY, bold=True)
-            _add_text(s3, f"Analyse au {as_of}", 0.30, 0.68, 9.30, 0.25, 9, GREY)
-            # Logique Python d'audit automatique
-            _points_forts = []
-            _points_vigilance = []
-            _xirr_a = synth_main.get("irr_pct", 0.0) or 0.0
-            _val_a  = synth_main.get("val", 0.0) or 0.0
-            _net_a  = synth_main.get("net", 0.0) or 0.0
-            _perf_a = synth_main.get("perf_tot_pct", 0.0) or 0.0
-            _fee_c  = float(report.get("fee_contract_pct", 0.6) or 0.6)
-            if _xirr_a > 5.0:
-                _points_forts.append(f"Rendement solide : XIRR de {_xirr_a:.1f}%/an")
-            elif _xirr_a > 2.5:
-                _points_forts.append(f"Rendement positif : XIRR de {_xirr_a:.1f}%/an")
-            else:
-                _points_vigilance.append(f"Rendement limité : XIRR de {_xirr_a:.1f}%/an — sous l'inflation")
-            if _fee_c > 1.5:
-                _points_vigilance.append(f"Empilement de frais : {_fee_c:.2f}%/an limite la performance nette")
-            elif _fee_c < 0.8:
-                _points_forts.append(f"Enveloppe compétitive : frais contrat de {_fee_c:.2f}%/an")
-            if _perf_a > 10.0:
-                _points_forts.append(f"Performance historique de {_perf_a:.1f}% depuis l'ouverture")
-            elif _perf_a < 0:
-                _points_vigilance.append(f"Performance négative : {_perf_a:.1f}% depuis l'ouverture")
-            if not _points_forts:
-                _points_forts.append("Portefeuille en cours de construction")
-            if not _points_vigilance:
-                _points_vigilance.append("Aucun point de vigilance identifié à ce stade")
-            # Col gauche — Points forts
-            _add_rect(s3, 0.28, 1.05, 4.50, 0.32, GREEN)
-            _add_text(s3, "✓ Points forts", 0.36, 1.09, 4.34, 0.24, 10, WHITE, bold=True)
-            for pfi, pf in enumerate(_points_forts[:3]):
-                _pfy = 1.42 + pfi * 0.52
-                _add_rect(s3, 0.28, _pfy, 4.50, 0.45, WHITE, BORDER)
-                _add_text(s3, f"• {pf}", 0.36, _pfy + 0.05, 4.34, 0.36, 9, BLACK)
-            # Col droite — Points de vigilance
-            _add_rect(s3, 5.00, 1.05, 4.72, 0.32, RGBColor(0xCC, 0x44, 0x00))
-            _add_text(s3, "⚠ Points de vigilance", 5.08, 1.09, 4.56, 0.24, 10, WHITE, bold=True)
-            for pvi, pv in enumerate(_points_vigilance[:3]):
-                _pvy = 1.42 + pvi * 0.52
-                _add_rect(s3, 5.00, _pvy, 4.72, 0.45, WHITE, BORDER)
-                _add_text(s3, f"• {pv}", 5.08, _pvy + 0.05, 4.56, 0.36, 9, BLACK)
-            _add_text(s3,
-                      "⚠️ Simulation indicative basée sur l'historique de VL. "
-                      "Les performances passées ne préjugent pas des performances futures.",
-                      0.28, 5.00, 9.44, 0.22, 7, GREY)
-        else:  # valority seul
-            _add_text(s3, f"La Stratégie {nom_cab}",
-                      0.30, 0.15, 9.30, 0.55, 20, NAVY, bold=True)
-            _add_text(s3,
-                      f"Une allocation construite pour {nom_cli}" if nom_cli
-                      else "Allocation conseiller",
-                      0.30, 0.68, 9.30, 0.25, 9, GREY)
-            _val_b  = synthB.get("val", 0.0) or 0.0
-            _net_b  = synthB.get("net", 0.0) or 0.0
-            _xirr_b = synthB.get("irr_pct", 0.0) or 0.0
-            _perf_b = synthB.get("perf_tot_pct", 0.0) or 0.0
-            _s3b_kpis = [
-                ("Valeur simulée", _fe(_val_b), "Notre allocation", GREEN),
-                ("Rendement annualisé", f"{_xirr_b:+.2f}%", "XIRR net de frais", BLUE),
-                ("Performance totale", f"{_perf_b:+.2f}%", "Depuis l'ouverture", GREEN),
-            ]
-            for ki3b, (klbl3b, kval3b, ksub3b, kcolor3b) in enumerate(_s3b_kpis):
-                _ky3b = 1.10 + ki3b * 1.10
-                _add_rect(s3, 0.28, _ky3b, 4.20, 0.95, LGREY, BORDER)
-                _add_text(s3, klbl3b, 0.36, _ky3b + 0.06, 4.04, 0.22, 8, GREY)
-                _add_text(s3, kval3b, 0.36, _ky3b + 0.28, 4.04, 0.32, 18, kcolor3b, bold=True)
-                _add_text(s3, ksub3b, 0.36, _ky3b + 0.68, 4.04, 0.20, 7, GREY)
-            _add_rect(s3, 4.72, 1.05, 4.90, 3.55, ICE, BORDER)
-            _add_text(s3, "Notre approche",
-                      4.86, 1.12, 4.62, 0.28, 11, NAVY, bold=True)
-            _engagements_s3 = [
-                ("Maîtrise de la volatilité",
-                 "Allocation diversifiée limitant le drawdown"),
-                ("Performance nette optimisée",
-                 "Sélection de fonds à rapport qualité/frais élevé"),
-                ("Suivi actif",
-                 "Rééquilibrage selon les conditions de marché"),
-            ]
-            for ei3b, (et3b, ex3b) in enumerate(_engagements_s3):
-                _ey3b = 1.50 + ei3b * 0.90
-                _add_rect(s3, 4.80, _ey3b, 0.06, 0.55, GOLD)
-                _add_text(s3, et3b, 4.96, _ey3b + 0.04, 4.40, 0.24, 9, NAVY, bold=True)
-                _add_text(s3, ex3b, 4.96, _ey3b + 0.28, 4.40, 0.24, 8, GREY)
-            _add_text(s3,
-                      "⚠️ Simulation historique. Les performances passées ne préjugent pas des performances futures.",
-                      0.28, 5.00, 9.44, 0.22, 7, GREY)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 4 — Transparence des frais
-        # ══════════════════════════════════════════════════════════════════════
-        s4 = prs.slides.add_slide(blank_layout)
-        _add_rect(s4, 0, 0, 10, 5.625, LGREY)
-        _left_stripe(s4, GOLD)
-        _footer(s4)
-        _add_text(s4, "Transparence des frais",
-                  0.30, 0.15, 9.30, 0.55, 20, NAVY, bold=True)
-        _add_text(s4, "Décomposition du coût total de détention de votre portefeuille",
-                  0.30, 0.68, 9.30, 0.25, 9, GREY)
-        # Tableau frais par couche
-        _frais_headers = ["Support", "TER fonds (%/an)", "Frais contrat (%/an)", "Coût total"]
-        _col_w4 = [4.2, 1.8, 1.8, 1.8]
-        _col_x4 = [0.28]
-        for _cw4 in _col_w4[:-1]:
-            _col_x4.append(_col_x4[-1] + _cw4)
-        _row_y4 = 1.10
-        for ci4, (_cx4, _ch4) in enumerate(zip(_col_x4, _frais_headers)):
-            _add_rect(s4, _cx4, _row_y4, _col_w4[ci4], 0.28, NAVY)
-            _add_text(s4, _ch4, _cx4 + 0.05, _row_y4 + 0.04, _col_w4[ci4] - 0.10, 0.22, 8, WHITE, bold=True)
-        _positions_frais = positions_df_main if not positions_df_main.empty else pd.DataFrame()
-        _fee_contract = report.get("fee_contract_pct", 0.6)
-        if not _positions_frais.empty:
-            for ri4, row4 in enumerate(_positions_frais.head(7).itertuples(index=False)):
-                _ry4 = _row_y4 + 0.28 + ri4 * 0.30
-                _bg4 = WHITE if ri4 % 2 == 0 else LGREY
-                _add_rect(s4, 0.28, _ry4, 9.60, 0.30, _bg4)
-                _nom4 = str(getattr(row4, "Nom", "—"))[:42]
-                _ter4 = float(getattr(row4, "TER_%", getattr(row4, "fee_uc_pct", 0)) or 0)
-                _tot4 = _ter4 + float(_fee_contract or 0)
-                _vals4 = [_nom4, f"{_ter4:.2f}%", f"{_fee_contract:.2f}%", f"{_tot4:.2f}%"]
-                for ci4b, (_cx4b, _rv4) in enumerate(zip(_col_x4, _vals4)):
-                    _tc4 = RGBColor(0xCC, 0x22, 0x00) if (ci4b == 3 and _tot4 > 2.0) else BLACK
-                    _add_text(s4, _rv4, _cx4b + 0.05, _ry4 + 0.05, _col_w4[ci4b] - 0.10, 0.22, 8, _tc4)
-        else:
-            _add_text(s4, "Données de frais non disponibles — ajoutez des fonds pour les voir ici.",
-                      0.28, 1.50, 9.44, 0.40, 10, GREY)
-        # Alerte Clean Shares si assureur Spirica
-        _assureur_s4 = CONTRACTS_REGISTRY.get(
-            report.get("contrat_label", ""), {}
-        ).get("assureur", "")
-        if _assureur_s4 == "Spirica":
-            _add_rect(s4, 0.28, 3.10, 9.44, 0.44, RGBColor(0xFF, 0xF8, 0xE1), GOLD)
-            _add_text(s4,
-                      "✨ Optimisation possible — Spirica : accès aux parts institutionnelles (I) "
-                      "sur certains fonds éligibles → économie potentielle de −0,5% à −1%/an.",
-                      0.38, 3.15, 9.00, 0.34, 8, RGBColor(0x7B, 0x5E, 0x00))
-        # Encart "Impact des frais sur 10 ans"
-        _add_rect(s4, 0.28, 3.62, 9.44, 1.30, NAVY)
-        _add_text(s4, "Impact des frais sur 10 ans (simulation)",
-                  0.38, 3.68, 9.00, 0.28, 10, GOLD, bold=True)
-        _cap = float(val or 10000.0)
-        _fee_total_est = float(_fee_contract or 0.6)
-        _brut_10 = _cap * (1.07 ** 10)
-        _net_10  = _cap * ((1.07 - _fee_total_est / 100) ** 10)
-        _drag_10 = _brut_10 - _net_10
-        _add_text(s4,
-                  f"Capital initial {_fe(_cap)} · Rendement brut hypothétique 7%/an",
-                  0.38, 3.94, 9.00, 0.22, 8, ICE)
-        _add_text(s4,
-                  f"Valeur brute : {_fe(_brut_10)}   →   Valeur nette de frais : {_fe(_net_10)}",
-                  0.38, 4.14, 9.00, 0.22, 8, ICE)
-        _add_text(s4,
-                  f"Coût cumulé des frais sur 10 ans : {_fe(_drag_10)}",
-                  0.38, 4.42, 5.00, 0.30, 14, GOLD, bold=True)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 4bis — Fiscalité & Levier fiscal
-        # ══════════════════════════════════════════════════════════════════════
-        s4b = prs.slides.add_slide(blank_layout)
-        _add_rect(s4b, 0, 0, 10, 5.625, WHITE)
-        _left_stripe(s4b, BLUE)
-        _footer(s4b)
-        _add_text(s4b, "Levier fiscal — Assurance-vie",
-                  0.30, 0.15, 9.30, 0.55, 20, NAVY, bold=True)
-        _cli_label = f"pour {nom_cli}" if nom_cli else ""
-        _add_text(s4b,
-                  f"Optimisation de l'abattement annuel {_cli_label} — Art. 158-6 CGI",
-                  0.30, 0.68, 9.30, 0.25, 9, GREY)
-        # Bloc abattement annuel
-        _sit_fam = report.get("situation_familiale", "Célibataire / veuf / divorcé")
-        _is_couple = "Couple" in str(_sit_fam)
-        _abat_annuel = 9200.0 if _is_couple else 4600.0
-        _abat_label  = "9 200 € (couple)" if _is_couple else "4 600 € (célibataire)"
-        _add_rect(s4b, 0.28, 1.10, 4.50, 2.50, LGREY, BORDER)
-        _add_text(s4b, "Abattement annuel disponible",
-                  0.36, 1.16, 4.34, 0.28, 10, NAVY, bold=True)
-        _add_text(s4b, _abat_label,
-                  0.36, 1.48, 4.34, 0.42, 24, GREEN, bold=True)
-        _add_text(s4b,
-                  "Sur la quote-part de gains dans chaque rachat\n"
-                  "Après 8 ans de détention du contrat\n"
-                  "Aucun IR sur les gains dans cette limite",
-                  0.36, 1.96, 4.34, 0.70, 8, GREY)
-        _add_rect(s4b, 0.36, 2.75, 0.06, 0.60, GOLD)
-        _add_text(s4b, "Stratégie recommandée",
-                  0.52, 2.78, 4.00, 0.24, 9, NAVY, bold=True)
-        _add_text(s4b,
-                  f"Rachat annuel optimisé pour utiliser l'abattement\n"
-                  f"de {_abat_label} sans générer d'IR",
-                  0.52, 3.02, 4.00, 0.40, 8, GREY)
-        # Bloc projection économie fiscale
-        _add_rect(s4b, 5.00, 1.10, 4.72, 2.50, ICE, BORDER)
-        _add_text(s4b, "Économie IR estimée sur 10 ans",
-                  5.08, 1.16, 4.56, 0.28, 10, NAVY, bold=True)
-        _tmi_ref = 0.30
-        _eco_ir_annual = _abat_annuel * _tmi_ref
-        _eco_ir_10ans  = _eco_ir_annual * 10
-        _add_text(s4b, f"{_fe(_eco_ir_10ans)}",
-                  5.08, 1.48, 4.56, 0.48, 28, GOLD, bold=True)
-        _add_text(s4b,
-                  f"Base : TMI 30% · {_abat_label}/an · 10 ans",
-                  5.08, 1.96, 4.56, 0.22, 8, GREY)
-        _eco_rows = [
-            (f"Économie IR/an",     f"{_fe(_eco_ir_annual)}"),
-            (f"Économie IR/10 ans", f"{_fe(_eco_ir_10ans)}"),
-            ("PS inévitables",     "17,2% sur la fraction de gains"),
-        ]
-        for eri, (el, ev) in enumerate(_eco_rows):
-            _ery = 2.25 + eri * 0.42
-            _add_text(s4b, el, 5.08, _ery, 2.50, 0.30, 8, GREY)
-            _add_text(s4b, ev, 7.60, _ery, 2.00, 0.30, 9, NAVY, bold=True, align="right")
-        # Bloc transmission
-        _add_rect(s4b, 0.28, 3.75, 9.44, 1.15, NAVY)
-        _add_text(s4b, "Transmission — Art. 990I",
-                  0.38, 3.80, 9.00, 0.28, 10, GOLD, bold=True)
-        _add_text(s4b,
-                  "Versements avant 70 ans : 152 500 € exonérés par bénéficiaire · "
-                  "Hors succession · Transmission facilitée entre générations",
-                  0.38, 4.08, 9.00, 0.30, 8, ICE)
-        _add_text(s4b,
-                  "⚠️ Simulation indicative. Consultez un fiscaliste pour votre situation personnelle.",
-                  0.38, 4.50, 9.00, 0.22, 7, GREY)
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 4b — Diversification (Niveau 1 uniquement — pas de ratios)
-        # ══════════════════════════════════════════════════════════════════════
-        _pptx_div_A = report.get("diversification_A")
-        _pptx_div_B = report.get("diversification_B")
-        _pptx_risk_A = report.get("risk_A")
-        _pptx_risk_B = report.get("risk_B")
-        _has_pptx_div = _pptx_div_A is not None or _pptx_div_B is not None
-
-        if _has_pptx_div:
-            s_div = prs.slides.add_slide(blank_layout)
-            _add_rect(s_div, 0, 0, 10, 5.625, WHITE)
-            _add_rect(s_div, 0, 0, 0.18, 5.625, NAVY)
-            _add_rect(s_div, 0.18, 0, 9.82, 0.72, NAVY)
-            _add_text(s_div, "Diversification de votre portefeuille",
-                      0.42, 0.12, 9.20, 0.52, 18, WHITE, bold=True)
-            _add_text(s_div, "  ".join(filter(None, [nom_cab, as_of])),
-                      0.42, 5.38, 9.00, 0.20, 7, GREY, align="center")
-
-            def _pptx_div_col(slide, div_res, risk_res, x, w, col_label):
-                _add_text(slide, col_label, x, 0.82, w, 0.28, 11, NAVY, bold=True)
-                _y = 1.15
-                if div_res is None:
-                    _add_text(slide, "Données insuffisantes (min. 2 lignes).", x, _y, w, 0.28, 9, GREY)
-                    return
-                _n_tot = div_res["n_lines"]
-                _n_eff = div_res.get("n_effective", _n_tot)
-                _avg = div_res["avg_corr"]
-                if _n_eff == _n_tot:
-                    _dlbl = f"{_n_tot} lignes → {_n_eff} sources réelles"
-                    _dcol = GREEN
-                elif _n_eff >= _n_tot - 1:
-                    _dlbl = f"{_n_tot} lignes → {_n_eff} sources réelles"
-                    _dcol = RGBColor(0xF0, 0x8C, 0x00)
-                else:
-                    _dlbl = f"{_n_tot} lignes → seulement {_n_eff} sources réelles"
-                    _dcol = RGBColor(0xCC, 0x00, 0x00)
-                _add_text(slide, _dlbl, x, _y, w, 0.40, 18, _dcol, bold=True)
-                _y += 0.50
-                _add_text(slide,
-                          f"Corrélation moyenne : {_avg:.0%}  |  {_n_tot} lignes analysées",
-                          x, _y, w, 0.24, 8, GREY)
-                _y += 0.30
-                for _ni, _nj, _c in div_res["doublons"]:
-                    _add_text(slide, f"⚠ Doublon : {_ni} / {_nj} ({_c:.0%})", x, _y, w, 0.22, 8, RGBColor(0xCC, 0x00, 0x00))
-                    _y += 0.25
-                for _ni, _nj, _c in div_res["vigilance"][:2]:
-                    _add_text(slide, f"~ Similaire : {_ni} / {_nj} ({_c:.0%})", x, _y, w, 0.22, 8, RGBColor(0xF0, 0x8C, 0x00))
-                    _y += 0.25
-                if risk_res:
-                    _y = max(_y, 2.80)
-                    _add_text(slide, f"Volatilité annuelle : {risk_res['vol_ann_pct']:.1f}%", x, _y, w, 0.22, 9, NAVY)
-                    _y += 0.26
-                    _add_text(slide, f"Pire baisse historique : {risk_res['max_dd_pct']:.1f}%", x, _y, w, 0.22, 9, NAVY)
-
-            _pptx_mode = report.get("mode", "compare")
-            if _pptx_mode == "compare":
-                _add_rect(s_div, 5.28, 0.78, 0.02, 4.50, LGREY)  # séparateur
-                _pptx_div_col(s_div, _pptx_div_A, _pptx_risk_A, 0.42, 4.60, "Portefeuille Client")
-                _pptx_div_col(s_div, _pptx_div_B, _pptx_risk_B, 5.40, 4.30, "Proposition Cabinet")
-            elif _pptx_mode == "valority":
-                _pptx_div_col(s_div, _pptx_div_B, _pptx_risk_B, 0.42, 9.20, "Portefeuille Cabinet")
-            else:
-                _pptx_div_col(s_div, _pptx_div_A, _pptx_risk_A, 0.42, 9.20, "Portefeuille Client")
-
-        # ══════════════════════════════════════════════════════════════════════
-        # SLIDE 5 — Conclusion / Engagements
-        # ══════════════════════════════════════════════════════════════════════
-        s5 = prs.slides.add_slide(blank_layout)
-        _add_rect(s5, 0, 0, 10, 5.625, NAVY)
-        _add_rect(s5, 0, 0, 0.18, 5.625, GOLD)
-
-        _add_text(s5, "Votre conseiller\nà vos côtés",
-                  0.75, 0.45, 5.50, 1.10, 28, WHITE, bold=True)
-        _add_rect(s5, 0.75, 1.70, 2.00, 0.04, GOLD)
-
-        _engagements = [
-            ("Transparence",
-             "Simulations basées sur les frais réels de votre contrat."),
-            ("Indépendance",
-             "Sélection de fonds fondée sur la performance."),
-            ("Suivi",
-             "Point annuel sur l'évolution de votre allocation."),
-        ]
-        for ei, (etitle, etxt) in enumerate(_engagements):
-            _ey = 1.90 + ei * 0.95
-            _add_rect(s5, 0.75, _ey, 0.05, 0.60, GOLD)
-            _add_text(s5, etitle, 0.90, _ey + 0.04, 4.50, 0.28, 12, WHITE, bold=True)
-            _add_text(s5, etxt,   0.90, _ey + 0.32, 4.50, 0.28, 9, ICE)
-
-        _footer_parts = [nom_cab, "Document confidentiel"]
-        if nom_cli:
-            _footer_parts.append(nom_cli)
-        if as_of:
-            _footer_parts.append(as_of)
-        _add_text(s5, "  ·  ".join(_footer_parts),
-                  0.28, 5.38, 9.44, 0.20, 7, GREY, align="center")
-
-        # ── Sérialisation ─────────────────────────────────────────────────────
-        buf = BytesIO()
-        prs.save(buf)
-        buf.seek(0)
-        return buf.read()
 
 
     def _years_between(d0: pd.Timestamp, d1: pd.Timestamp) -> float:
@@ -6370,21 +5172,10 @@ personnalisé.
     report_data = {
         "as_of": fmt_date(TODAY),
         "mode": st.session_state.get("MODE_ANALYSE", "compare"),
+        # FIXED (P1): transmettre le résultat analyse fondamentale dans report_data
+        # pour éviter qu'il ne soit absent si le session_state est lu trop tôt
+        "fa_result": st.session_state.get("FUND_ANALYSIS_RESULT"),
     }
-    report_data["nom_client"] = st.session_state.get("NOM_CLIENT", "").strip()
-    report_data["nom_cabinet"] = st.session_state.get("NOM_CABINET", "").strip()
-    report_data["fee_contract_pct"] = st.session_state.get("FEE_A", 0.6)
-    report_data["situation_familiale"] = st.session_state.get(
-        "tax_situation_familiale", "Célibataire / veuf / divorcé"
-    )
-    report_data["contrat_label"] = st.session_state.get("CONTRACT_LABEL_A", "")
-    report_data["date_ouverture"] = ""
-    _all_lines = st.session_state.get("A_lines", [])
-    if _all_lines:
-        _dates = [ln.get("buy_date") for ln in _all_lines if ln.get("buy_date")]
-        if _dates:
-            _min_date = min(pd.Timestamp(d) for d in _dates)
-            report_data["date_ouverture"] = _min_date.strftime("%d/%m/%Y")
 
     mode_report = report_data["mode"]
     df_client_lines = build_positions_dataframe("A_lines") if show_client else pd.DataFrame()
@@ -6485,12 +5276,6 @@ personnalisé.
     )
 
     st.session_state["REPORT_DATA"] = report_data
-    # Pré-générer le PDF une seule fois (évite double-rendu au 1er chargement)
-    try:
-        _pdf_bytes_cache = generate_pdf_report(report_data)
-    except Exception:
-        _pdf_bytes_cache = b""
-    st.session_state["PDF_BYTES_CACHE"] = _pdf_bytes_cache
 
     # ------------------------------------------------------------
     # Bloc final : Comparaison OU "Frais & valeur créée"
@@ -6501,8 +5286,7 @@ personnalisé.
     # CAS 1 — MODE COMPARAISON
     # ============================
     if mode == "compare":
-        st.markdown("---")
-        st.subheader("⚖️ Comparaison")
+        st.subheader("📌 Comparaison : Client vs Cabinet")
 
         gain_vs_client = (valB - valA) if (valA is not None and valB is not None) else 0.0
         delta_xirr = (xirrB - xirrA) if (xirrA is not None and xirrB is not None) else None
@@ -6527,7 +5311,12 @@ personnalisé.
                     f"{delta_xirr:+.2f}%" if delta_xirr is not None else "—",
                 )
 
-
+            st.markdown(
+                f"""
+Aujourd’hui, avec votre allocation actuelle, votre portefeuille vaut **{to_eur(valA)}**.  
+Avec l’allocation Cabinet, il serait autour de **{to_eur(valB)}**, soit environ **{to_eur(gain_vs_client)}** de plus.
+"""
+            )
 
     # ============================
     # CAS 2 — MODE ANALYSE SIMPLE
@@ -6551,7 +5340,6 @@ personnalisé.
             fee_pct = st.session_state.get("FEE_A", 0.0)
             title = "🧍 Portefeuille — Frais & valeur créée"
 
-        st.markdown("---")
         st.subheader("📌 Analyse : frais & valeur créée")
 
         if brut > 0 and net >= 0 and val >= 0 and isinstance(start_min, pd.Timestamp):
@@ -6564,12 +5352,12 @@ personnalisé.
                 st.markdown(f"#### {title}")
                 st.caption(
                     f"Période : **{fmt_date(start_min)} → {fmt_date(TODAY)}** "
-                    f"• Frais d'entrée : **{fee_pct:.2f}%**"
+                    f"• Frais d’entrée : **{fee_pct:.2f}%**"
                 )
 
-                _pad_l, c1, c2, c3, _pad_r = st.columns([0.5, 1, 1, 1, 0.5])
+                c1, c2, c3 = st.columns(3)
                 with c1:
-                    st.metric("Frais d'entrée payés", to_eur(fees_paid))
+                    st.metric("Frais d’entrée payés", to_eur(fees_paid))
                 with c2:
                     st.metric("Valeur créée (net)", to_eur(value_created))
                 with c3:
@@ -6595,400 +5383,33 @@ personnalisé.
                 if fees_paid > 0 and value_created > 0:
                     ratio = value_created / fees_paid
                     st.markdown(
-                        f"**Lecture :** {to_eur(fees_paid)} de frais d'entrée ont généré "
+                        f"**Lecture :** {to_eur(fees_paid)} de frais d’entrée ont généré "
                         f"**{to_eur(value_created)}** de valeur nette créée à date "
                         f"(**×{ratio:.1f}**)."
                     )
                 elif fees_paid > 0 and value_created <= 0:
                     st.markdown(
-                        f"**Lecture :** {to_eur(fees_paid)} de frais d'entrée payés. "
+                        f"**Lecture :** {to_eur(fees_paid)} de frais d’entrée payés. "
                         f"Le portefeuille affiche une moins-value nette de **{to_eur(abs(value_created))}** à date."
                     )
         else:
-            st.info("Ajoutez des lignes (et/ou des versements) pour afficher l'analyse frais & valeur créée.")
+            st.info("Ajoutez des lignes (et/ou des versements) pour afficher l’analyse frais & valeur créée.")
 
-    # ------------------------------------------------------------
-    # Indicateurs de risque & performance (2 niveaux)
-    # ------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("📊 Indicateurs de risque & performance")
-
-    _bench_sym = st.session_state.get("BENCHMARK_SYMBOL", "CW8.PA")
-    _euro_rate_A = st.session_state.get("EURO_RATE_A", 2.0)
-    _euro_rate_B = st.session_state.get("EURO_RATE_B", 2.5)
-    _linesA = st.session_state.get("A_lines", [])
-    _linesB = st.session_state.get("B_lines", [])
-    _fee_A = float(st.session_state.get("FEE_A", 0.0))
-    _fee_B = float(st.session_state.get("FEE_B", 0.0))
-
-    # ── Calculs diversification ────────────────────────────────────────────
-    _div_A = compute_diversification_score(_linesA, _euro_rate_A) if (show_client and _linesA) else None
-    _div_B = compute_diversification_score(_linesB, _euro_rate_B) if (show_valority and _linesB) else None
-    _risk_A = portfolio_risk_stats(_linesA, _euro_rate_A, fee_pct=_fee_A) if (show_client and _linesA) else None
-    _risk_B = portfolio_risk_stats(_linesB, _euro_rate_B, fee_pct=_fee_B) if (show_valority and _linesB) else None
-
-    # ── Calculs ratios techniques ──────────────────────────────────────────
-    _sharpe_A = compute_sharpe_ratio(_linesA, _euro_rate_A, _fee_A) if (show_client and _linesA) else None
-    _sharpe_B = compute_sharpe_ratio(_linesB, _euro_rate_B, _fee_B) if (show_valority and _linesB) else None
-    _sortino_A = compute_sortino_ratio(_linesA, _euro_rate_A, _fee_A) if (show_client and _linesA) else None
-    _sortino_B = compute_sortino_ratio(_linesB, _euro_rate_B, _fee_B) if (show_valority and _linesB) else None
-    _ba_A = compute_beta_alpha(_linesA, _euro_rate_A, _fee_A, _bench_sym) if (show_client and _linesA) else None
-    _ba_B = compute_beta_alpha(_linesB, _euro_rate_B, _fee_B, _bench_sym) if (show_valority and _linesB) else None
-
-    # Stocker le bêta pour le stress-test
-    st.session_state["BETA_AUTO_A"] = _ba_A["beta"] if _ba_A else None
-    st.session_state["BETA_AUTO_B"] = _ba_B["beta"] if _ba_B else None
-
-    # Indicateurs de risque pour le PDF — inséré ICI après calcul des variables
-    report_data["diversification_A"] = _div_A
-    report_data["diversification_B"] = _div_B
-    report_data["risk_A"] = _risk_A
-    report_data["risk_B"] = _risk_B
-    report_data["sharpe_A"] = _sharpe_A
-    report_data["sharpe_B"] = _sharpe_B
-    report_data["sortino_A"] = _sortino_A
-    report_data["sortino_B"] = _sortino_B
-    report_data["beta_alpha_A"] = _ba_A
-    report_data["beta_alpha_B"] = _ba_B
-    report_data["ratios_A"] = {
-        "sharpe": _sharpe_A,
-        "sortino": _sortino_A,
-        "beta_alpha": _ba_A,
-    }
-    report_data["ratios_B"] = {
-        "sharpe": _sharpe_B,
-        "sortino": _sortino_B,
-        "beta_alpha": _ba_B,
-    }
-
-    _mode_risk = st.session_state.get("MODE_ANALYSE", "compare")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # ① DIVERSIFICATION
-    # ══════════════════════════════════════════════════════════════════════
-    st.markdown("##### 🧩 Diversification du portefeuille")
-
-    def _render_diversification(div_res, label):
-        """Affiche la diversification d'un portefeuille en langage clair."""
-        if div_res is None:
-            st.info("Ajoutez au moins 2 lignes pour analyser la diversification.")
-            return
-        _n = div_res["n_lines"]
-        _n_eff = div_res.get("n_effective", _n)
-        _avg = div_res["avg_corr"]
-
-        # ── Fonds réellement utiles ──
-        if _n_eff == _n:
-            st.markdown(f"✅ **{_n} lignes → {_n_eff} sources de diversification réelles**")
-            st.caption("Chaque fonds apporte une exposition distincte au portefeuille.")
-        elif _n_eff >= _n - 1:
-            st.markdown(f"🟠 **{_n} lignes → {_n_eff} sources de diversification réelles**")
-            st.caption(f"{_n - _n_eff} fonds est redondant avec un autre — il double les frais sans améliorer la diversification.")
-        else:
-            st.markdown(f"🔴 **{_n} lignes → seulement {_n_eff} sources de diversification réelles**")
-            st.caption(f"{_n - _n_eff} fonds sont redondants — vous payez des frais sur {_n} lignes pour la diversification de {_n_eff}.")
-
-        # ── Diversification globale ──
-        if _avg < 0.30:
-            st.caption(f"🟢 Bonne couverture multi-classes (corrélation moyenne : {_avg:.0%}) — les actifs se complètent bien.")
-        elif _avg < 0.60:
-            st.caption(f"🟠 Couverture correcte (corrélation moyenne : {_avg:.0%}) — des améliorations sont possibles.")
-        else:
-            st.caption(f"🔴 Couverture insuffisante (corrélation moyenne : {_avg:.0%}) — les actifs évoluent trop dans le même sens.")
-
-        # ── Doublons nommés ──
-        for _ni, _nj, _c in div_res["doublons"]:
-            st.warning(
-                f"⚠️ **{_ni}** et **{_nj}** sont quasi-identiques (corrélation {_c:.0%}). "
-                f"Garder les deux double les frais sans apporter de diversification."
-            )
-        for _ni, _nj, _c in div_res["vigilance"]:
-            st.caption(f"🟠 {_ni} et {_nj} ont un comportement très similaire (corrélation {_c:.0%}).")
-
-    if _mode_risk == "compare":
-        _col_div_a, _col_div_b = st.columns(2)
-        with _col_div_a:
-            st.markdown("**🧍 Client**")
-            _render_diversification(_div_A, "Client")
-        with _col_div_b:
-            st.markdown("**🏢 Cabinet**")
-            _render_diversification(_div_B, "Cabinet")
-        # Narratif comparatif
-        if _div_A and _div_B:
-            with st.container(border=True):
-                _eff_A = _div_A["n_effective"]
-                _eff_B = _div_B["n_effective"]
-
-                if _eff_B > _eff_A and _eff_A > 0:
-                    _ratio = _eff_B / _eff_A
-                    if _ratio >= 2.0:
-                        _ratio_txt = f"{_ratio:.0f}× plus de sources"
-                    else:
-                        _pct = (_ratio - 1) * 100
-                        _ratio_txt = f"{_pct:.0f}% de sources en plus"
-                    st.success(
-                        f"💬 **Concrètement, la proposition du cabinet offre {_ratio_txt} "
-                        f"de diversification réelles** ({_eff_B} contre {_eff_A} actuellement). "
-                        f"Quand un secteur ou une classe d'actifs subit une baisse, "
-                        f"les autres lignes du portefeuille ne sont pas entraînées dans la chute "
-                        f"— le capital est mieux protégé et la reprise est plus rapide."
-                    )
-                elif _eff_A > _eff_B and _eff_B > 0:
-                    st.warning(
-                        f"💬 Votre portefeuille actuel est mieux diversifié "
-                        f"({_eff_A} sources réelles contre {_eff_B} pour la proposition). "
-                        f"La proposition compense peut-être par une meilleure sélection de fonds "
-                        f"— vérifiez les indicateurs de rendement ci-dessous."
-                    )
-                else:
-                    st.info(
-                        f"💬 Les deux portefeuilles ont une diversification comparable "
-                        f"({_eff_A} sources réelles). L'avantage de la proposition se joue "
-                        f"sur d'autres critères (rendement, frais, protection baissière)."
-                    )
-    elif _mode_risk == "client":
-        _render_diversification(_div_A, "Client")
-    else:
-        _render_diversification(_div_B, "Cabinet")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # ② RENDEMENT, RISQUE & VALEUR AJOUTÉE (langage client)
-    # ══════════════════════════════════════════════════════════════════════
-    st.markdown("---")
-    st.markdown("##### 💡 Rendement, risque & valeur ajoutée")
-
-    _VS_DIV = "<div style='text-align:center; padding-top:1.4rem; font-size:1.1rem; color:#aaa;'>vs</div>"
-
-    def _render_single_ratios_narrative(sharpe, sortino, ba, euro_rate, val, risk, label):
-        """Affiche les ratios en langage client pour un portefeuille seul."""
-        # ── Rendement/risque vs fonds euros ──
-        if sharpe is not None:
-            with st.container(border=True):
-                st.markdown("**Le rendement justifie-t-il le risque pris ?**")
-                _gain_sh = sharpe * 1000
-                st.metric("Rendement excédentaire", f"{_gain_sh:,.0f} €", delta="pour 1 000 € de risque pris")
-                if sharpe >= 1.0:
-                    _sh_comment = "C'est un bon ratio — au-dessus de 1 000 € c'est excellent."
-                elif sharpe >= 0.5:
-                    _sh_comment = "C'est correct — au-dessus de 1 000 € c'est considéré excellent, en-dessous de 500 € le risque n'est pas assez rémunéré."
-                else:
-                    _sh_comment = "Le risque pris n'est pas suffisamment rémunéré. En-dessous de 500 €, il est légitime de se demander si le jeu en vaut la chandelle."
-                st.caption(
-                    f"💬 Par rapport au fonds euros ({euro_rate:.2f}%/an, sans risque), {label} "
-                    f"génère **{_gain_sh:,.0f} €** de rendement supplémentaire pour chaque 1 000 € de risque accepté. "
-                    f"{_sh_comment}"
-                )
-        # ── Protection baissière ──
-        if sortino and sortino > 0:
-            with st.container(border=True):
-                st.markdown("**Protection en cas de baisse**")
-                _perte = 1.0 / sortino
-                st.metric("Perte par euro gagné", f"{_perte:.2f} €", delta="en phase de baisse")
-                if _perte < 0.7:
-                    _so_comment = "C'est une bonne protection."
-                elif _perte < 1.0:
-                    _so_comment = "C'est correct."
-                else:
-                    _so_comment = "Le portefeuille est vulnérable aux baisses — les pertes dépassent les gains."
-                st.caption(
-                    f"💬 Pour chaque 1 € gagné dans les bonnes phases, {label} "
-                    f"perd {_perte:.2f} € dans les mauvaises. {_so_comment}"
-                )
-        # ── Alpha ──
-        _al = ba["alpha_pct"] if ba else None
-        if _al is not None and abs(_al) > 0.5:
-            with st.container(border=True):
-                _bench_name = st.session_state.get("BENCHMARK_LABEL", "MSCI World").split(" (")[0]
-                st.markdown("**Valeur ajoutée de l'allocation**")
-                st.metric("Performance vs marché", f"{_al:+.2f} %/an",
-                          delta="surperformance" if _al > 0 else "sous-performance")
-                _al_comment = "l'allocation ajoute de la valeur." if _al > 0 else "une optimisation est possible."
-                st.caption(
-                    f"💬 Comparé à un simple ETF {_bench_name} au même niveau de risque, "
-                    f"{label} fait **{_al:+.1f}%/an** "
-                    f"{'de plus — ' + _al_comment if _al > 0 else 'de moins — ' + _al_comment}"
-                )
-
-    if _mode_risk == "compare" and _sharpe_A is not None and _sharpe_B is not None:
-        # ── Rendement vs risque ──
-        with st.container(border=True):
-            st.markdown("**Le rendement justifie-t-il le risque pris ?**")
-            _col_rr_a, _col_rr_vs, _col_rr_b = st.columns([5, 1, 5])
-            with _col_rr_a:
-                _gain_A_sh = _sharpe_A * 1000
-                st.metric("🧍 Client", f"{_gain_A_sh:,.0f} €", delta="pour 1 000 € de risque")
-            with _col_rr_vs:
-                st.markdown(_VS_DIV, unsafe_allow_html=True)
-            with _col_rr_b:
-                _gain_B_sh = _sharpe_B * 1000
-                st.metric("🏢 Cabinet", f"{_gain_B_sh:,.0f} €", delta="pour 1 000 € de risque")
-            _avantage_pct = ((_sharpe_B / _sharpe_A) - 1) * 100 if _sharpe_A > 0 else 0
-            if _sharpe_B > _sharpe_A:
-                st.caption(
-                    f"💬 À risque comparable, la proposition cabinet génère **{_avantage_pct:+.0f}%** de rendement "
-                    f"excédentaire en plus par rapport au fonds euros. "
-                    f"Concrètement, pour le même niveau de risque, chaque euro investi travaille {abs(_avantage_pct):.0f}% plus efficacement."
-                )
-            else:
-                st.caption(
-                    f"💬 Le portefeuille actuel génère un meilleur rendement par unité de risque ({_gain_A_sh:,.0f} € vs {_gain_B_sh:,.0f} €)."
-                )
-
-        # ── Protection à la baisse ──
-        if _sortino_A is not None and _sortino_B is not None and _sortino_A > 0 and _sortino_B > 0:
-            with st.container(border=True):
-                st.markdown("**Comment le portefeuille résiste-t-il aux baisses ?**")
-                _perte_A = 1.0 / _sortino_A
-                _perte_B = 1.0 / _sortino_B
-                _col_pb_a, _col_pb_vs, _col_pb_b = st.columns([5, 1, 5])
-                with _col_pb_a:
-                    st.metric("🧍 Client", f"{_perte_A:.2f} €", delta="perdu pour 1 € gagné en hausse")
-                with _col_pb_vs:
-                    st.markdown(_VS_DIV, unsafe_allow_html=True)
-                with _col_pb_b:
-                    st.metric("🏢 Cabinet", f"{_perte_B:.2f} €", delta="perdu pour 1 € gagné en hausse")
-                _reduction = (1 - _perte_B / _perte_A) * 100 if _perte_A > 0 else 0
-                if _reduction > 0:
-                    st.caption(
-                        f"💬 Dans les phases de baisse, la proposition limite les pertes : "
-                        f"**{_reduction:.0f}% de pertes en moins** par rapport au portefeuille actuel."
-                    )
-                elif _reduction < -10:
-                    st.caption(
-                        f"💬 Le portefeuille actuel résiste mieux aux baisses "
-                        f"({_perte_A:.2f} € vs {_perte_B:.2f} € perdu par euro gagné)."
-                    )
-
-        # ── Valeur ajoutée (Alpha) ──
-        _alpha_A = _ba_A["alpha_pct"] if _ba_A else None
-        _alpha_B = _ba_B["alpha_pct"] if _ba_B else None
-        if _alpha_A is not None and _alpha_B is not None:
-            with st.container(border=True):
-                st.markdown("**L'allocation crée-t-elle de la valeur ?**")
-                _bench_label_disp = st.session_state.get("BENCHMARK_LABEL", "MSCI World (CW8.PA)").split(" (")[0]
-                _col_al_a, _col_al_vs, _col_al_b = st.columns([5, 1, 5])
-                with _col_al_a:
-                    st.metric("🧍 Client", f"{_alpha_A:+.2f} %/an",
-                              delta="surperformance" if _alpha_A > 0 else "sous-performance")
-                with _col_al_vs:
-                    st.markdown(_VS_DIV, unsafe_allow_html=True)
-                with _col_al_b:
-                    st.metric("🏢 Cabinet", f"{_alpha_B:+.2f} %/an",
-                              delta="surperformance" if _alpha_B > 0 else "sous-performance")
-                _alpha_conclu = "La proposition crée davantage de valeur ajoutée." if _alpha_B > _alpha_A + 0.5 else ""
-                st.caption(
-                    f"💬 Par rapport à un simple ETF {_bench_label_disp} avec le même niveau de risque : "
-                    f"le portefeuille client fait **{_alpha_A:+.1f}%/an** "
-                    f"{'de plus' if _alpha_A > 0 else 'de moins'}, "
-                    f"la proposition fait **{_alpha_B:+.1f}%/an** "
-                    f"{'de plus' if _alpha_B > 0 else 'de moins'}. "
-                    f"{_alpha_conclu}"
-                )
-
-        # ── Verdict global ──
-        with st.container(border=True):
-            _wins = []
-            _losses = []
-            if _sharpe_B > _sharpe_A + 0.05:
-                _r_sh = abs(((_sharpe_B / _sharpe_A) - 1) * 100) if _sharpe_A > 0 else 0
-                _wins.append(f"rendement/risque {_r_sh:.0f}% plus efficace")
-            elif _sharpe_A > _sharpe_B + 0.05:
-                _losses.append("rendement/risque")
-            if _sortino_A and _sortino_B and _sortino_B > _sortino_A + 0.05:
-                _r_so = (1 - (1 / _sortino_B) / (1 / _sortino_A)) * 100 if _sortino_A > 0 else 0
-                _wins.append(f"{abs(_r_so):.0f}% de pertes en moins dans les baisses")
-            elif _sortino_A and _sortino_B and _sortino_A > _sortino_B + 0.05:
-                _losses.append("protection baissière")
-            _alpha_A_v = _ba_A["alpha_pct"] if _ba_A else None
-            _alpha_B_v = _ba_B["alpha_pct"] if _ba_B else None
-            if _alpha_B_v is not None and _alpha_A_v is not None and _alpha_B_v > _alpha_A_v + 0.5:
-                _wins.append(f"alpha supérieur de {_alpha_B_v - _alpha_A_v:.1f} pts/an")
-            if len(_wins) >= 2:
-                st.success(f"✅ **La proposition cabinet est plus efficace** : {', '.join(_wins)}.")
-            elif len(_wins) == 1:
-                st.info(f"Amélioration côté Cabinet : {_wins[0]}."
-                        + (f" Point d'attention : {', '.join(_losses)}." if _losses else ""))
-            elif _losses:
-                st.warning(f"⚠️ Le portefeuille actuel fait mieux sur : {', '.join(_losses)}.")
-            else:
-                st.info("Profils de risque comparables. L'intérêt du changement repose sur d'autres critères (diversification, frais).")
-
-    elif _mode_risk == "client" and _sharpe_A is not None:
-        _render_single_ratios_narrative(_sharpe_A, _sortino_A, _ba_A, _euro_rate_A, valA, _risk_A, "votre portefeuille")
-
-    elif _mode_risk == "valority" and _sharpe_B is not None:
-        _render_single_ratios_narrative(_sharpe_B, _sortino_B, _ba_B, _euro_rate_B, valB, _risk_B, "ce portefeuille")
-
-    # ── Détails techniques (expander fermé, pour le CGP) ──────────────────
-    with st.expander("📐 Détails techniques — Ratios", expanded=False):
-        st.caption("Données brutes à destination du conseiller.")
-        _rows_tech = []
-        if _sharpe_A is not None or _sharpe_B is not None:
-            _rows_tech.append({
-                "Indicateur": "Sharpe",
-                "Client": f"{_sharpe_A:.2f}" if _sharpe_A is not None else "—",
-                "Cabinet": f"{_sharpe_B:.2f}" if _sharpe_B is not None else "—",
-            })
-        if _sortino_A is not None or _sortino_B is not None:
-            _rows_tech.append({
-                "Indicateur": "Sortino",
-                "Client": f"{_sortino_A:.2f}" if _sortino_A is not None else "—",
-                "Cabinet": f"{_sortino_B:.2f}" if _sortino_B is not None else "—",
-            })
-        if _ba_A or _ba_B:
-            _bench_lbl_tech = st.session_state.get("BENCHMARK_LABEL", "MSCI World")
-            _rows_tech.append({
-                "Indicateur": f"Bêta (vs {_bench_lbl_tech})",
-                "Client": f"{_ba_A['beta']:.2f}" if _ba_A else "—",
-                "Cabinet": f"{_ba_B['beta']:.2f}" if _ba_B else "—",
-            })
-            _rows_tech.append({
-                "Indicateur": "Alpha",
-                "Client": f"{_ba_A['alpha_pct']:+.2f}%" if _ba_A else "—",
-                "Cabinet": f"{_ba_B['alpha_pct']:+.2f}%" if _ba_B else "—",
-            })
-        if _risk_A or _risk_B:
-            _rows_tech.append({
-                "Indicateur": "Volatilité ann.",
-                "Client": f"{_risk_A['vol_ann_pct']:.2f}%" if _risk_A else "—",
-                "Cabinet": f"{_risk_B['vol_ann_pct']:.2f}%" if _risk_B else "—",
-            })
-            _rows_tech.append({
-                "Indicateur": "Max drawdown",
-                "Client": f"{_risk_A['max_dd_pct']:.2f}%" if _risk_A else "—",
-                "Cabinet": f"{_risk_B['max_dd_pct']:.2f}%" if _risk_B else "—",
-            })
-        if _rows_tech:
-            st.dataframe(pd.DataFrame(_rows_tech), hide_index=True, use_container_width=True)
-        st.caption(f"_Taux sans risque : fonds euros du contrat. Indice : {st.session_state.get('BENCHMARK_LABEL', 'MSCI World')}._")
-
-    with st.expander("ℹ️ Comprendre ces indicateurs", expanded=False):
-        st.markdown("""
-**Diversification effective** — Nombre de fonds qui apportent réellement une exposition nouvelle. Un fonds corrélé à plus de 80% avec un autre ne réduit pas le risque global — il double les frais sans améliorer la protection.
-
-**Rendement par unité de risque** — Mesure combien de rendement supplémentaire votre portefeuille génère au-delà du fonds euros (sans risque), pour chaque unité de volatilité subie. Plus c'est haut, mieux c'est — 1 000 € pour 1 000 € de risque est un bon seuil.
-
-**Protection en phase de baisse** — Compare les gains en période haussière aux pertes en période baissière. Un portefeuille bien construit perd moins qu'il ne gagne.
-
-**Valeur ajoutée de l'allocation (Alpha)** — Mesure si l'allocation fait mieux qu'un simple ETF indiciel avec le même niveau de risque. Un alpha positif signifie que le choix des fonds crée de la valeur au-delà du marché.
-
-**Ratio de Sharpe / Sortino / Bêta** — Détails dans l'expander "Détails techniques" ci-dessus.
-
-_Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alternative naturelle du client en assurance-vie._
-""")
 
     # ------------------------------------------------------------
     # Tables positions
     # ------------------------------------------------------------
-    st.markdown("---")
-    st.subheader("📋 Positions & composition")
     if show_client:
         positions_table("Portefeuille 1 — Client", "A_lines")
     if show_valority:
         positions_table("Portefeuille 2 — Cabinet", "B_lines")
 
+    st.subheader("Composition du portefeuille")
 
     def _render_portfolio_pie(port_key: str, title: str):
+        if not MATPLOTLIB_AVAILABLE:
+            st.warning(f"{title} : Camembert indisponible ({MATPLOTLIB_ERROR}).")
+            return
         df_positions = build_positions_dataframe(port_key)
         if df_positions.empty:
             st.info(f"{title} : Données indisponibles.")
@@ -6997,37 +5418,15 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
         if df_pie.empty:
             st.info(f"{title} : Données indisponibles.")
             return
-        # Palette premium Bleu Nuit / Acier / Or / complémentaires
-        _WM_PALETTE = [
-            "#1B2A4A", "#4A6FA5", "#C9A84C", "#2E86AB",
-            "#5C4033", "#6B8F71", "#8B5E3C", "#A0A0A0",
-        ]
-        df_pie["color"] = [
-            _WM_PALETTE[i % len(_WM_PALETTE)] for i in range(len(df_pie))
-        ]
-        df_pie["Part_frac"] = df_pie["Part %"] / 100.0
-        donut = (
-            alt.Chart(df_pie)
-            .mark_arc(innerRadius=60, outerRadius=115)
-            .encode(
-                theta=alt.Theta("Valeur actuelle €:Q", stack=True),
-                color=alt.Color(
-                    "Nom:N",
-                    scale=alt.Scale(
-                        domain=df_pie["Nom"].tolist(),
-                        range=_WM_PALETTE[: len(df_pie)],
-                    ),
-                    legend=alt.Legend(title="Support", orient="right"),
-                ),
-                tooltip=[
-                    alt.Tooltip("Nom:N", title="Support"),
-                    alt.Tooltip("Valeur actuelle €:Q", title="Valeur", format=",.0f"),
-                    alt.Tooltip("Part %:Q", title="Part %", format=".1f"),
-                ],
-            )
-            .properties(title="", height=260)
+        fig, ax = plt.subplots(figsize=(5, 3))
+        ax.pie(
+            df_pie["Valeur actuelle €"],
+            labels=df_pie["Nom"],
+            autopct="%1.1f%%",
         )
-        st.altair_chart(donut, use_container_width=True)
+        ax.set_title(title)
+        st.pyplot(fig)
+        plt.close(fig)
         st.dataframe(
             df_pie[["Nom", "Valeur actuelle €", "Part %"]].style.format(
                 {
@@ -7042,74 +5441,13 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
     if show_client and show_valority:
         col_a, col_b = st.columns(2)
         with col_a:
-            st.markdown("#### Portefeuille Client")
             _render_portfolio_pie("A_lines", "Portefeuille Client")
         with col_b:
-            st.markdown("#### Portefeuille Cabinet")
             _render_portfolio_pie("B_lines", "Portefeuille Cabinet")
     elif show_client:
-        st.markdown("#### Portefeuille Client")
         _render_portfolio_pie("A_lines", "Portefeuille Client")
     elif show_valority:
-        st.markdown("#### Portefeuille Cabinet")
         _render_portfolio_pie("B_lines", "Portefeuille Cabinet")
-
-    # ── Transparence frais & Clean Shares ────────────────────────
-    st.markdown("---")
-    with st.expander("🔍 Transparence des frais & Clean Shares", expanded=False):
-        st.caption(
-            "Décomposition des frais par couche : frais du support (TER, intégré dans la VL) "
-            "et frais de l'enveloppe contrat (déduits de la performance)."
-        )
-        # Identifier les fonds UC du portefeuille actif
-        _cs_port_key = "A_lines" if show_client else "B_lines"
-        _cs_contract = st.session_state.get(
-            "CONTRACT_LABEL_A" if show_client else "CONTRACT_LABEL_B", ""
-        )
-        _cs_assureur = CONTRACTS_REGISTRY.get(_cs_contract, {}).get("assureur", "—")
-        # Clean Shares par assureur (référentiel simplifié)
-        _CLEAN_SHARE_ASSUREURS = {"Spirica"}  # Spirica permet les parts I sur certains fonds
-        _cs_lines = [
-            ln for ln in st.session_state.get(_cs_port_key, [])
-            if str(ln.get("isin", "")).upper() not in ("EUROFUND", "STRUCTURED")
-        ]
-        if not _cs_lines:
-            st.info("Aucun fonds UC dans le portefeuille sélectionné.")
-        else:
-            _frais_rows = []
-            for _ln in _cs_lines:
-                _name = (_ln.get("name") or _ln.get("isin") or "—")[:35]
-                _ter = float(_ln.get("fee_uc_pct") or 0.0)
-                _contrat_fee = float(_ln.get("fee_contract_pct") or
-                                     st.session_state.get("FEE_A" if show_client else "FEE_B", 0.6))
-                _total = _ter + _contrat_fee
-                _frais_rows.append({
-                    "Support": _name,
-                    "TER fonds (%/an)": round(_ter, 2),
-                    "Frais contrat (%/an)": round(_contrat_fee, 2),
-                    "Coût total (%/an)": round(_total, 2),
-                })
-            _frais_df = pd.DataFrame(_frais_rows)
-            st.dataframe(
-                _frais_df.style.format({
-                    "TER fonds (%/an)": "{:.2f}%",
-                    "Frais contrat (%/an)": "{:.2f}%",
-                    "Coût total (%/an)": "{:.2f}%",
-                }).background_gradient(subset=["Coût total (%/an)"], cmap="YlOrRd"),
-                hide_index=True, use_container_width=True,
-            )
-            st.caption(
-                "Le TER est intégré dans la valeur liquidative publiée. "
-                "Les frais contrat sont déduits en sus par l'assureur."
-            )
-            # Alerte Clean Shares si assureur éligible
-            if _cs_assureur in _CLEAN_SHARE_ASSUREURS:
-                st.info(
-                    f"✨ **Optimisation possible — {_cs_assureur}** : Ce contrat donne "
-                    "accès aux parts institutionnelles (parts I / Clean Shares) sur certains "
-                    "fonds éligibles, potentiellement **−0.5% à −1%/an de frais de gestion**. "
-                    "Vérifiez l'éligibilité de chaque fonds directement auprès de l'assureur."
-                )
 
     # APP – Composition
     def _wrap_label_app(label: str, width: int = 28) -> str:
@@ -7117,113 +5455,89 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
             return "—"
         return "\n".join(textwrap.wrap(str(label), width=width)) or str(label)
 
-    if show_valority and not dfB.empty:
-        st.markdown("---")
-        st.subheader("📈 Évolution du portefeuille Cabinet")
-        st.caption(
-            "Comparaison année par année entre le capital net investi "
-            "et la valeur du portefeuille."
-        )
-        # ── Construire les données année par année ────────────────
-        _blines_b = st.session_state.get("B_lines", [])
-        _fee_b = float(st.session_state.get("FEE_B", 0.0) or 0.0)
-        _M_B_evol = float(st.session_state.get("M_B", 0.0) or 0.0)
-        _ONE_B = float(st.session_state.get("ONE_B", 0.0) or 0.0)
-        _ONE_B_DATE = st.session_state.get("ONE_B_DATE", pd.Timestamp("2024-07-01").date())
-        _start_b = startB_min if isinstance(startB_min, pd.Timestamp) else TODAY
+    def _render_valority_composition_section():
+        if not MATPLOTLIB_AVAILABLE:
+            st.warning(f"Cabinet : graphique indisponible ({MATPLOTLIB_ERROR}).")
+            return
+        df_positions = build_positions_dataframe("B_lines")
+        if df_positions.empty:
+            st.info("Aucune donnée pour le portefeuille Cabinet.")
+            return
 
-        _years_b = sorted(set(dfB.index.year))
-        _bar_rows: List[Dict[str, Any]] = []
-
-        for _y in _years_b:
-            _mask_y = dfB.index.year == _y
-            if not _mask_y.any():
-                continue
-            _val_end = float(dfB.loc[_mask_y, "Valeur"].iloc[-1])
-            _year_end = pd.Timestamp(f"{_y}-12-31")
-
-            # 1) Versements initiaux nets
-            _net_init = sum(
-                float(ln.get("amount_gross", 0)) * (1.0 - _fee_b / 100.0)
-                for ln in _blines_b
-                if pd.Timestamp(ln.get("buy_date") or _start_b) <= _year_end
-            )
-
-            # 2) Versement ponctuel net
-            _net_one = 0.0
-            if _ONE_B > 0 and pd.Timestamp(_ONE_B_DATE) <= _year_end:
-                _net_one = _ONE_B * (1.0 - _fee_b / 100.0)
-
-            # 3) Versements mensuels nets cumulés
-            _net_monthly_evol = 0.0
-            if _M_B_evol > 0:
-                _to_date = min(_year_end, TODAY)
-                _n_months = max(
-                    0,
-                    (_to_date.year - _start_b.year) * 12
-                    + (_to_date.month - _start_b.month),
-                )
-                _net_monthly_evol = _n_months * _M_B_evol * (1.0 - _fee_b / 100.0)
-
-            _net_cumul = _net_init + _net_one + _net_monthly_evol
-
-            _bar_rows.append({
-                "Année": str(_y),
-                "Capital net investi": round(_net_cumul, 2),
-                "Valeur du portefeuille": round(_val_end, 2),
-            })
-
-        _bar_df_evol = pd.DataFrame(_bar_rows)
-
-        if not _bar_df_evol.empty:
-            _bar_long_evol = _bar_df_evol.melt(
-                "Année", var_name="Type", value_name="Montant (€)"
-            )
-            _evol_chart = (
-                alt.Chart(_bar_long_evol)
-                .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                .encode(
-                    x=alt.X("Année:N", title="Année", axis=alt.Axis(labelAngle=0)),
-                    y=alt.Y(
-                        "Montant (€):Q",
-                        title="Montant (€)",
-                        axis=alt.Axis(format=",.0f"),
-                        scale=alt.Scale(zero=True),
-                    ),
-                    color=alt.Color(
-                        "Type:N",
-                        scale=alt.Scale(
-                            domain=["Capital net investi", "Valeur du portefeuille"],
-                            range=["#1B2A4A", "#C9A84C"],
-                        ),
-                        legend=alt.Legend(title=None, orient="bottom"),
-                    ),
-                    xOffset="Type:N",
-                    tooltip=[
-                        alt.Tooltip("Année:N"),
-                        alt.Tooltip("Type:N"),
-                        alt.Tooltip("Montant (€):Q", format=",.2f"),
-                    ],
-                )
-                .properties(height=400)
-            )
-            st.altair_chart(_evol_chart, use_container_width=True)
-
-            # Récapitulatif chiffré de la dernière année disponible
-            _last_row = _bar_df_evol.iloc[-1]
-            _pv_total = _last_row["Valeur du portefeuille"] - _last_row["Capital net investi"]
-            _pv_pct = (
-                _pv_total / _last_row["Capital net investi"] * 100.0
-            ) if _last_row["Capital net investi"] > 0 else 0.0
-            _cols_legend = st.columns(3)
-            with _cols_legend[0]:
-                st.metric("Capital net investi", to_eur(_last_row["Capital net investi"]))
-            with _cols_legend[1]:
-                st.metric("Valeur actuelle", to_eur(_last_row["Valeur du portefeuille"]))
-            with _cols_legend[2]:
-                st.metric("Plus-value", to_eur(_pv_total), delta=f"{_pv_pct:+.1f}%")
+        df = df_positions.copy()
+        total_val = df["Valeur actuelle €"].sum()
+        if total_val > 0:
+            df["Poids %"] = df["Valeur actuelle €"] / total_val * 100.0
         else:
-            st.info("Données insuffisantes pour afficher l'évolution du capital.")
+            total_net = df["Net investi €"].sum()
+            if total_net > 0:
+                df["Poids %"] = df["Net investi €"] / total_net * 100.0
+            else:
+                df["Poids %"] = 0.0
+                if len(df) > 0:
+                    df.loc[df.index[0], "Poids %"] = 100.0
+        df = df.sort_values("Poids %", ascending=False)
+
+        if len(df) > 8:
+            df_main = df.iloc[:8].copy()
+            df_other = df.iloc[8:]
+            other_row = pd.DataFrame(
+                {
+                    "Nom": ["Autres"],
+                    "ISIN / Code": ["—"],
+                    "Date d'achat": ["—"],
+                    "Net investi €": [df_other["Net investi €"].sum()],
+                    "Valeur actuelle €": [df_other["Valeur actuelle €"].sum()],
+                    "Perf €": [df_other["Perf €"].sum()],
+                    "Perf %": [np.nan],
+                    "Poids %": [df_other["Poids %"].sum()],
+                }
+            )
+            df = pd.concat([df_main, other_row], ignore_index=True)
+
+        if len(df) >= 2:
+            fig, ax = plt.subplots(figsize=(5.2, 3.2))
+            wedges, _ = ax.pie(
+                df["Poids %"],
+                startangle=90,
+                labels=None,
+                wedgeprops=dict(width=0.35, edgecolor="white"),
+            )
+            labels = [
+                f"{_wrap_label_app(nm)} ({pct:.1f}%)"
+                for nm, pct in zip(df["Nom"], df["Poids %"])
+            ]
+            ax.legend(
+                wedges,
+                labels,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=False,
+                fontsize=8,
+            )
+            ax.set_aspect("equal")
+            fig.tight_layout(rect=[0, 0, 0.78, 1])
+            st.pyplot(fig)
+            plt.close(fig)
+        else:
+            st.info("Portefeuille concentré : 100% sur une seule ligne.")
+
+        df_table = df[["Nom", "ISIN / Code", "Poids %", "Net investi €", "Valeur actuelle €"]]
+        st.dataframe(
+            df_table.style.format(
+                {
+                    "Poids %": "{:,.2f}%".format,
+                    "Net investi €": to_eur,
+                    "Valeur actuelle €": to_eur,
+                }
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    if show_valority:
+        st.subheader("Composition du portefeuille (Cabinet)")
+        _render_valority_composition_section()
 
     # ----------------------------------------------------------------
     # Section téléchargement des rapports
@@ -7236,16 +5550,17 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
             return b""
 
     st.markdown("---")
-    st.subheader("📥 Télécharger")
+    st.subheader("📥 Télécharger le rapport")
     _report_data = st.session_state.get("REPORT_DATA")
     if _report_data is not None:
-        _report_data_standard = {**_report_data}
+        # ── Rapport standard (sans analyse fondamentale) ──────────────────
+        _report_data_standard = {**_report_data, "fa_result": None}
         _html_standard = build_html_report(_report_data_standard)
         _col1, _col2 = st.columns(2)
         with _col1:
             st.download_button(
                 "📄 Rapport standard (PDF)",
-                data=st.session_state.get("PDF_BYTES_CACHE", b""),
+                data=_generate_pdf_safe(_report_data_standard),
                 file_name="rapport_portefeuille.pdf",
                 mime="application/pdf",
                 help="Rapport de performance et composition, sans analyse Morningstar",
@@ -7259,53 +5574,47 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
                 help="Version HTML du rapport standard, consultable dans un navigateur",
             )
 
-        # ── One-Pager Proposition d'Arbitrage ─────────────────────
-        if _report_data is not None:
-            st.markdown("---")
-            if REPORTLAB_AVAILABLE:
-                _report_onepager = {
-                    **_report_data_standard,
-                    "fee_a_pct": st.session_state.get("FEE_A", 0.6),
-                    "fee_b_pct": st.session_state.get("FEE_B", 0.6),
-                }
-                st.download_button(
-                    "📋 Proposition d'arbitrage (PDF one-pager)",
-                    data=_build_onepager_pdf(_report_onepager),
-                    file_name="proposition_arbitrage.pdf",
-                    mime="application/pdf",
-                    help="PDF synthétique prêt à présenter : état actuel vs cible, "
-                         "gain estimé, levier fiscal.",
-                )
-
-        # ── Présentation PPTX ─────────────────────────────────────────────
+        # ── Rapport complet avec analyse fondamentale ─────────────────────
         st.markdown("---")
-        if PPTX_AVAILABLE:
-            def _generate_pptx_safe(rd: Dict[str, Any]) -> bytes:
-                try:
-                    return generate_pptx_report(rd)
-                except Exception as e:
-                    st.session_state["_PPTX_LAST_ERROR"] = str(e)
-                    return b""
-
-            _nom_client_safe = (
-                st.session_state.get("NOM_CLIENT", "") or "client"
-            ).strip().replace(" ", "_")
-
-            _col_p1, _col_p2 = st.columns(2)
-            _report_pptx_standard = {**_report_data_standard}
-            with _col_p1:
+        _fa_result_live = st.session_state.get("FUND_ANALYSIS_RESULT")
+        _fa_available = (
+            _fa_result_live is not None
+            and not (_fa_result_live or {}).get("error")
+            and bool(
+                (_fa_result_live or {}).get("allocation")
+                or (_fa_result_live or {}).get("geography")
+                or (_fa_result_live or {}).get("sectors_equity")
+            )
+        )
+        if _fa_available:
+            _report_data_full = {
+                **_report_data,
+                "fa_result": _fa_result_live,
+            }
+            _html_full = build_html_report(_report_data_full)
+            _col3, _col4 = st.columns(2)
+            with _col3:
                 st.download_button(
-                    "📊 Présentation client (PPTX)",
-                    data=_generate_pptx_safe(_report_pptx_standard),
-                    file_name=f"presentation_{_nom_client_safe}.pptx",
-                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                    help="Présentation PowerPoint 5 slides pour le client",
+                    "🔬 Rapport complet avec analyse fondamentale (PDF)",
+                    data=_generate_pdf_safe(_report_data_full),
+                    file_name="rapport_complet_fondamentaux.pdf",
+                    mime="application/pdf",
+                    help="Rapport de performance + radiographie Morningstar des sous-jacents",
                 )
-            _pptx_err = st.session_state.pop("_PPTX_LAST_ERROR", None)
-            if _pptx_err:
-                st.warning(f"Erreur génération PPTX : {_pptx_err}")
+            with _col4:
+                st.download_button(
+                    "🔬 Rapport complet avec analyse fondamentale (HTML)",
+                    data=_html_full.encode("utf-8"),
+                    file_name="rapport_complet_fondamentaux.html",
+                    mime="text/html",
+                    help="Version HTML du rapport complet avec analyse Morningstar",
+                )
         else:
-            st.caption(f"PPTX indisponible : {PPTX_ERROR}")
+            st.info(
+                "💡 Pour télécharger le rapport complet incluant l’analyse "
+                "fondamentale Morningstar, lancez d’abord l’analyse dans "
+                "l’expander 🔬 ci-dessous."
+            )
     else:
         st.info("Les rapports seront disponibles après le calcul du portefeuille.")
 
@@ -7315,8 +5624,8 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
 - Dans chaque portefeuille, vous pouvez **soit** ajouter des *fonds recommandés* (onglet dédié),
   **soit** utiliser la *saisie libre* avec ISIN / code.
 - Pour le **fonds en euros**, utilisez le symbole **EUROFUND** (taux paramétrable dans la barre de gauche).
-- Les frais d'entrée s'appliquent à chaque investissement.
-- Le **rendement total** est la performance globale depuis l'origine (valeur actuelle / net investi).
+- Les frais d’entrée s’appliquent à chaque investissement.
+- Le **rendement total** est la performance globale depuis l’origine (valeur actuelle / net investi).
 - Le **rendement annualisé** utilise le XIRR (prise en compte des dates et montants).
 - En mode **Personnalisé**, vous pouvez affecter précisément les versements mensuels et ponctuels à chaque ligne,
   avec un contrôle automatique de cohérence par rapport aux montants bruts saisis.
@@ -7378,19 +5687,6 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
                     chartA = _corr_heatmap_chart(corrA, "Corrélation des lignes — Portefeuille Client")
                     if chartA is not None:
                         st.altair_chart(chartA, use_container_width=True)
-                    # Alerte si corrélation excessive
-                    _corrA_vals = corrA.where(
-                        ~pd.DataFrame(
-                            [[i == j for j in range(len(corrA.columns))]
-                             for i in range(len(corrA.index))],
-                            index=corrA.index, columns=corrA.columns
-                        )
-                    )
-                    if not _corrA_vals.isna().all().all() and float(_corrA_vals.max().max()) > 0.90:
-                        st.caption(
-                            "⚠️ Information : Certains fonds sont très fortement corrélés (>0.90), "
-                            "limitant l'impact réel de la diversification."
-                        )
 
         if show_client and show_valority:
             st.markdown("---")
@@ -7433,389 +5729,687 @@ _Taux sans risque utilisé : le taux du fonds euros du contrat, car c'est l'alte
                     chartB = _corr_heatmap_chart(corrB, "Corrélation des lignes — Portefeuille Cabinet")
                     if chartB is not None:
                         st.altair_chart(chartB, use_container_width=True)
-                    # Alerte si corrélation excessive
-                    _corrB_vals = corrB.where(
-                        ~pd.DataFrame(
-                            [[i == j for j in range(len(corrB.columns))]
-                             for i in range(len(corrB.index))],
-                            index=corrB.index, columns=corrB.columns
-                        )
-                    )
-                    if not _corrB_vals.isna().all().all() and float(_corrB_vals.max().max()) > 0.90:
-                        st.caption(
-                            "⚠️ Information : Certains fonds sont très fortement corrélés (>0.90), "
-                            "limitant l'impact réel de la diversification."
-                        )
 
     # ----------------------------------------------------------------
-    # Module "Drag" — Traînée de frais contrat
+    # Analyse fondamentale des sous-jacents
     # ----------------------------------------------------------------
     st.markdown("---")
-    with st.expander("⚡ Analyse du Drag — Traînée de frais contrat", expanded=False):
+    with st.expander("🔬 Analyse fondamentale des sous-jacents", expanded=False):
         st.caption(
-            "Visualise l'impact cumulé des frais de gestion du contrat sur la performance "
-            "d'un fonds. Plus le 'Drag' est élevé, plus l'enveloppe érode la performance du support."
+            "Agrégation des données Morningstar pondérées par la valeur "
+            "actuelle de chaque fonds. Fonds euros et produits structurés "
+            "exclus. Données mises à jour toutes les 7 jours."
         )
-        # Time to Market par assureur
-        _TTM = {
-            "Suravenir": {"délai": "J+2 (arbitrage)", "note": "Ordres transmis avant 12h exécutés J+1 VL"},
-            "Spirica":   {"délai": "J+3 (arbitrage)", "note": "Délai réglementaire Spirica standard"},
-        }
-        _assureur_A = CONTRACTS_REGISTRY.get(
-            st.session_state.get("CONTRACT_LABEL_A", ""), {}
-        ).get("assureur", "—")
-        _assureur_B = CONTRACTS_REGISTRY.get(
-            st.session_state.get("CONTRACT_LABEL_B", ""), {}
-        ).get("assureur", "—")
-        _tc1, _tc2 = st.columns(2)
-        with _tc1:
-            _ttm_a = _TTM.get(_assureur_A, {"délai": "—", "note": "—"})
-            st.metric("Time to Market — Contrat Client", _ttm_a["délai"])
-            st.caption(f"({_assureur_A}) {_ttm_a['note']}")
-        with _tc2:
-            _ttm_b = _TTM.get(_assureur_B, {"délai": "—", "note": "—"})
-            st.metric("Time to Market — Contrat Cabinet", _ttm_b["délai"])
-            st.caption(f"({_assureur_B}) {_ttm_b['note']}")
-        st.markdown("---")
-        st.markdown("**Simulation du Drag sur un fonds UC**")
-        _drag_c1, _drag_c2 = st.columns(2)
-        with _drag_c1:
-            _drag_perf = st.number_input(
-                "Performance brute annuelle du fonds (%)",
-                min_value=-20.0, max_value=40.0,
-                value=7.0, step=0.5, key="drag_perf_brute",
-            )
-            _drag_fee = st.number_input(
-                "Frais de gestion contrat (%/an)",
-                min_value=0.0, max_value=3.0,
-                value=0.6, step=0.1, key="drag_fee_contrat",
-            )
-        with _drag_c2:
-            _drag_ter = st.number_input(
-                "TER du fonds (%/an, déjà dans la VL)",
-                min_value=0.0, max_value=3.0,
-                value=1.5, step=0.1, key="drag_ter",
-            )
-            _drag_years = st.slider(
-                "Horizon (années)", min_value=1, max_value=30,
-                value=10, key="drag_years",
-            )
-        _drag_net = _drag_perf - _drag_fee
-        _cap_init = 10_000.0
-        _years_range = list(range(_drag_years + 1))
-        _brut_series = [_cap_init * (1 + _drag_perf / 100) ** y for y in _years_range]
-        _net_series  = [_cap_init * (1 + _drag_net  / 100) ** y for y in _years_range]
-        _drag_df = pd.DataFrame({
-            "Année": _years_range * 2,
-            "Valeur (€)": _brut_series + _net_series,
-            "Série": ["Brut (hors frais contrat)"] * len(_years_range)
-                   + ["Net (après frais contrat)"]  * len(_years_range),
-        })
-        _drag_loss = _brut_series[-1] - _net_series[-1]
-        _drag_area = (
-            alt.Chart(_drag_df)
-            .mark_area(opacity=0.18, interpolate="monotone")
-            .encode(
-                x=alt.X("Année:Q", title="Années"),
-                y=alt.Y("Valeur (€):Q", axis=alt.Axis(format=",.0f")),
-                color=alt.Color(
-                    "Série:N",
-                    scale=alt.Scale(
-                        domain=["Brut (hors frais contrat)", "Net (après frais contrat)"],
-                        range=["#1B2A4A", "#C9A84C"],
-                    ),
-                ),
-                tooltip=[
-                    alt.Tooltip("Année:Q"),
-                    alt.Tooltip("Série:N"),
-                    alt.Tooltip("Valeur (€):Q", format=",.0f"),
-                ],
-            )
-        )
-        _drag_line = (
-            alt.Chart(_drag_df)
-            .mark_line(strokeWidth=2.5, interpolate="monotone")
-            .encode(
-                x=alt.X("Année:Q"),
-                y=alt.Y("Valeur (€):Q"),
-                color=alt.Color(
-                    "Série:N",
-                    scale=alt.Scale(
-                        domain=["Brut (hors frais contrat)", "Net (après frais contrat)"],
-                        range=["#1B2A4A", "#C9A84C"],
-                    ),
-                ),
-            )
-        )
-        st.altair_chart((_drag_area + _drag_line).properties(height=300), use_container_width=True)
-        # ── Graphique comparatif barres : Brut vs Net en % et en € ──
-        st.markdown("**Comparatif annualisé : Performance brute vs nette de frais**")
-        _bar_data = pd.DataFrame({
-            "Métrique": [
-                "Rendement brut (%/an)",
-                "Rendement net (%/an)",
-                "Écart (Drag)",
-            ],
-            "Valeur": [
-                _drag_perf,
-                _drag_net,
-                _drag_perf - _drag_net,
-            ],
-            "Couleur": ["Brut", "Net", "Drag"],
-        })
-        _bar_chart = (
-            alt.Chart(_bar_data)
-            .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-            .encode(
-                x=alt.X(
-                    "Métrique:N",
-                    sort=None,
-                    axis=alt.Axis(labelAngle=0, labelFontSize=10),
-                    title="",
-                ),
-                y=alt.Y(
-                    "Valeur:Q",
-                    title="%/an",
-                    axis=alt.Axis(format=".1f"),
-                ),
-                color=alt.Color(
-                    "Couleur:N",
-                    scale=alt.Scale(
-                        domain=["Brut", "Net", "Drag"],
-                        range=["#1B2A4A", "#C9A84C", "#CC2200"],
-                    ),
-                    legend=None,
-                ),
-                tooltip=[
-                    alt.Tooltip("Métrique:N", title="Métrique"),
-                    alt.Tooltip("Valeur:Q", title="%/an", format=".2f"),
-                ],
-            )
-            .properties(height=220)
-        )
-        _text_bar = (
-            alt.Chart(_bar_data)
-            .mark_text(dy=-8, fontSize=11, fontWeight="bold")
-            .encode(
-                x=alt.X("Métrique:N", sort=None),
-                y=alt.Y("Valeur:Q"),
-                text=alt.Text("Valeur:Q", format=".2f"),
-                color=alt.value("#333333"),
-            )
-        )
-        st.altair_chart((_bar_chart + _text_bar).properties(height=220),
-                        use_container_width=True)
-        # Tableau récapitulatif € pour l'horizon choisi
-        _drag_table_df = pd.DataFrame({
-            "": ["Performance brute", "Performance nette", "Drag (coût frais)"],
-            "Taux (%/an)": [
-                f"{_drag_perf:.2f}%",
-                f"{_drag_net:.2f}%",
-                f"−{_drag_fee:.2f}%",
-            ],
-            f"Impact sur {_drag_years} ans (base {to_eur(_cap_init)})": [
-                f"+{to_eur(_brut_series[-1] - _cap_init)}",
-                f"+{to_eur(_net_series[-1] - _cap_init)}",
-                f"−{to_eur(_drag_loss)}",
-            ],
-        })
-        st.dataframe(_drag_table_df, hide_index=True, use_container_width=True)
-        st.warning(
-            f"💸 **Drag total sur {_drag_years} ans** : **{to_eur(_drag_loss)}** de valeur "
-            f"perdue uniquement à cause des frais de gestion contrat ({_drag_fee:.1f}%/an). "
-            f"Le TER du fonds ({_drag_ter:.1f}%/an) est déjà intégré dans la VL publiée."
-        )
-
-    # ----------------------------------------------------------------
-    # Module Stress-Test
-    # ----------------------------------------------------------------
-    st.markdown("---")
-    with st.expander("🧨 Stress-Test — Scénarios de crise", expanded=False):
-        st.caption(
-            "Estimation de l'impact d'un choc de marché ou de taux sur le portefeuille. "
-            "Les calculs de bêta sont approximatifs (base : corrélation historique avec l'indice)."
-        )
-        # Paramètres portefeuille actif
-        _st_val = valA if show_client else valB
-        _st_net = netA if show_client else netB
-        _st_lines = (
-            st.session_state.get("A_lines", []) if show_client
-            else st.session_state.get("B_lines", [])
-        )
-        _st_euro_rate = (
-            st.session_state.get("EURO_RATE_A", 2.0) if show_client
-            else st.session_state.get("EURO_RATE_B", 2.5)
-        )
-        # Calculer part euro vs UC
-        _uc_val = sum(
-            float(ln.get("montant_net", 0) or 0)
-            for ln in _st_lines
-            if str(ln.get("isin", "")).upper() not in ("EUROFUND", "STRUCTURED")
-        )
-        _euro_val = _st_val - _uc_val if _st_val > 0 else 0.0
-        _uc_pct = _uc_val / _st_val if _st_val > 0 else 0.5
-        _euro_pct = 1.0 - _uc_pct
-        st.info(
-            f"Portefeuille analysé : valeur **{to_eur(_st_val)}** — "
-            f"UC estimées **{_uc_pct*100:.0f}%** / Fonds euros **{_euro_pct*100:.0f}%**"
-        )
-        st.markdown("#### Scénario 1 — Choc de marché : CAC 40 −20%")
-        _auto_beta = (
-            st.session_state.get("BETA_AUTO_A")
-            if show_client
-            else st.session_state.get("BETA_AUTO_B")
-        )
-        if _auto_beta is not None:
-            _bench_lbl = st.session_state.get("BENCHMARK_LABEL", "MSCI World (CW8.PA)")
-            st.info(
-                f"Bêta calculé automatiquement : **{_auto_beta:.2f}** vs {_bench_lbl} "
-                f"(voir section « Indicateurs de risque & performance » ci-dessus)"
-            )
-            _use_auto_beta = st.checkbox(
-                "Utiliser le bêta calculé automatiquement",
-                value=True,
-                key="stress_use_auto_beta",
-                help="Décochez pour saisir un bêta manuel.",
-            )
-            if _use_auto_beta:
-                _beta = float(_auto_beta)
-            else:
-                _beta = st.slider(
-                    "Bêta manuel du portefeuille UC",
-                    min_value=0.0, max_value=2.0,
-                    value=round(float(_auto_beta) * 20) / 20,
-                    step=0.05,
-                    key="stress_beta_manual",
-                    help="Bêta > 1 : plus sensible que le marché. < 1 : plus défensif.",
-                )
+        if not MSTARPY_AVAILABLE:
+            st.warning("Module mstarpy non installé — analyse fondamentale indisponible.")
         else:
-            _beta = st.slider(
-                "Bêta estimé du portefeuille UC (1 = suit le marché)",
-                min_value=0.0, max_value=2.0, value=0.80, step=0.05,
-                key="stress_beta",
-                help="Bêta > 1 : plus sensible que le marché. < 1 : plus défensif.",
-            )
-        _choc_marche = -0.20
-        _perte_uc = _st_val * _uc_pct * _beta * _choc_marche
-        _val_post_marche = _st_val + _perte_uc
-        _sc1_c1, _sc1_c2, _sc1_c3 = st.columns(3)
-        _sc1_c1.metric("Perte estimée UC", to_eur(_perte_uc), delta=f"{_beta * _choc_marche * _uc_pct * 100:.1f}% du total")
-        _sc1_c2.metric("Valeur post-choc", to_eur(_val_post_marche))
-        _sc1_c3.metric(
-            "Perte vs investi",
-            f"{(_val_post_marche / _st_net - 1) * 100:.1f}%" if _st_net > 0 else "—",
-        )
-        st.markdown("---")
-        st.markdown("#### Scénario 2 — Choc de taux : +1% (impact fonds euros)")
-        _duration_euro = st.slider(
-            "Duration implicite du fonds euros (années)",
-            min_value=0.0, max_value=10.0, value=3.0, step=0.5,
-            key="stress_duration",
-            help="Approximation : un fonds euros majoritairement obligataire a une duration de 3-5 ans.",
-        )
-        _choc_taux = 0.01  # +1%
-        _perte_euro_pct = -_duration_euro * _choc_taux
-        _perte_euro = _st_val * _euro_pct * _perte_euro_pct
-        _val_post_taux = _st_val + _perte_euro
-        _sc2_c1, _sc2_c2, _sc2_c3 = st.columns(3)
-        _sc2_c1.metric("Perte estimée fonds €", to_eur(_perte_euro), delta=f"{_perte_euro_pct * _euro_pct * 100:.1f}% du total")
-        _sc2_c2.metric("Valeur post-choc", to_eur(_val_post_taux))
-        _sc2_c3.metric("Impact duration", f"−{_duration_euro * _choc_taux * 100:.1f}%")
-        st.markdown("---")
-        st.markdown("#### Scénario combiné — Krach global")
-        _crash_result = simulate_market_crash(
-            portfolio_value=_st_val,
-            uc_pct=_uc_pct,
-            euro_pct=_euro_pct,
-            beta=_beta,
-            crash_magnitude=0.20,
-            duration_euro=_duration_euro,
-            rate_shock=0.01,
-        )
-        _sc3_c1, _sc3_c2, _sc3_c3 = st.columns(3)
-        _sc3_c1.metric(
-            "Perte totale estimée",
-            to_eur(_crash_result["perte_totale"]),
-            delta=f"{_crash_result['pct_perte_total']:.1f}% du portefeuille",
-        )
-        _sc3_c2.metric(
-            "Valeur post-krach",
-            to_eur(_crash_result["valeur_post_choc"]),
-        )
-        _sc3_c3.metric(
-            "Retour à l'équilibre",
-            f"+{abs(_crash_result['pct_perte_total']) / (1 - abs(_crash_result['pct_perte_total']) / 100):.1f}% requis"
-            if _crash_result["pct_perte_total"] < 0 else "—",
-            help="Performance nécessaire pour récupérer la perte",
-        )
-        # Graphique waterfall simplifié (barres empilées)
-        _crash_df = pd.DataFrame({
-            "Composante": [
-                "Portefeuille initial",
-                "Perte UC (krach −20%)",
-                "Perte fonds € (taux +1%)",
-                "Valeur post-krach",
-            ],
-            "Valeur": [
-                _st_val,
-                _crash_result["perte_uc"],
-                _crash_result["perte_euro"],
-                _crash_result["valeur_post_choc"],
-            ],
-            "Type": ["Base", "Perte", "Perte", "Résultat"],
-        })
-        _crash_bar = (
-            alt.Chart(_crash_df)
-            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-            .encode(
-                x=alt.X("Composante:N", sort=None,
-                        axis=alt.Axis(labelAngle=-15, labelFontSize=9), title=""),
-                y=alt.Y("Valeur:Q", axis=alt.Axis(format=",.0f"), title="€"),
-                color=alt.Color(
-                    "Type:N",
-                    scale=alt.Scale(
-                        domain=["Base", "Perte", "Résultat"],
-                        range=["#1B2A4A", "#CC2200", "#C9A84C"],
-                    ),
-                    legend=alt.Legend(title=""),
-                ),
-                tooltip=[
-                    alt.Tooltip("Composante:N"),
-                    alt.Tooltip("Valeur:Q", format=",.0f", title="€"),
-                ],
-            )
-            .properties(height=260)
-        )
-        st.altair_chart(_crash_bar, use_container_width=True)
-        st.caption(
-            "⚠️ Simulation indicative uniquement — sensibilités linéaires. "
-            "Ne constitue pas une prévision ni un conseil en investissement."
-        )
+            # Sélection du portefeuille à analyser
+            if show_client and show_valority:
+                port_choice = st.radio(
+                    "Portefeuille à analyser",
+                    ["Client", "Cabinet"],
+                    horizontal=True,
+                    key="fa_port_choice",
+                )
+                lines_to_analyze = (
+                    st.session_state.get("A_lines", [])
+                    if port_choice == "Client"
+                    else st.session_state.get("B_lines", [])
+                )
+                fee_to_use = (
+                    st.session_state.get("FEE_A", 0.0)
+                    if port_choice == "Client"
+                    else st.session_state.get("FEE_B", 0.0)
+                )
+                euro_to_use = (
+                    st.session_state.get("EURO_RATE_A", 2.0)
+                    if port_choice == "Client"
+                    else st.session_state.get("EURO_RATE_B", 2.5)
+                )
+            elif show_client:
+                lines_to_analyze = st.session_state.get("A_lines", [])
+                fee_to_use = st.session_state.get("FEE_A", 0.0)
+                euro_to_use = st.session_state.get("EURO_RATE_A", 2.0)
+            else:
+                lines_to_analyze = st.session_state.get("B_lines", [])
+                fee_to_use = st.session_state.get("FEE_B", 0.0)
+                euro_to_use = st.session_state.get("EURO_RATE_B", 2.5)
+
+            uc_lines = [
+                ln for ln in lines_to_analyze
+                if str(ln.get("isin") or "").upper() not in ("EUROFUND", "STRUCTURED")
+            ]
+            if not uc_lines:
+                st.info(
+                    "Aucun fonds UC dans ce portefeuille. "
+                    "L'analyse fondamentale ne s'applique pas aux fonds euros "
+                    "et produits structurés."
+                )
+            else:
+                if st.button(
+                    "🔬 Lancer l'analyse fondamentale",
+                    key="fa_run_btn",
+                ):
+                    with st.spinner(
+                        "Chargement des données Morningstar… "
+                        "(première exécution : ~5-10 secondes par fonds)"
+                    ):
+                        agg = aggregate_portfolio_fundamentals(
+                            lines_to_analyze,
+                            euro_to_use,
+                            fee_to_use,
+                        )
+                    st.session_state["FUND_ANALYSIS_RESULT"] = agg
+                    st.rerun()
+                fa_agg = st.session_state.get("FUND_ANALYSIS_RESULT")
+                if fa_agg and not fa_agg.get("error"):
+                    _render_fundamentals_dashboard(fa_agg)
 
 
-def simulate_market_crash(
-    portfolio_value: float,
-    uc_pct: float,
-    euro_pct: float,
-    beta: float = 0.85,
-    crash_magnitude: float = 0.20,
-    duration_euro: float = 3.0,
-    rate_shock: float = 0.01,
-) -> Dict[str, float]:
-    """
-    Simule l'impact d'un krach combiné (marché + taux) sur un portefeuille.
-    Retourne les pertes estimées par composante et la valeur post-choc.
-    """
-    perte_uc     = portfolio_value * uc_pct   * beta   * (-crash_magnitude)
-    perte_euro   = portfolio_value * euro_pct * (-duration_euro * rate_shock)
-    perte_totale = perte_uc + perte_euro
+# ============================================================
+# MODULE ANALYSE FONDAMENTALE — fonctions module-level
+# ============================================================
+
+@st.cache_data(ttl=604800, show_spinner=False)
+def _load_fund_fundamentals(isin: str) -> Dict[str, Any]:
+    """Charge toutes les données fondamentales d'un fonds via mstarpy. TTL 7 jours."""
+    if not MSTARPY_AVAILABLE:
+        return {"found": False, "error": True, "isin": isin}
+    try:
+        fund = mstarpy.Funds(term=isin, pageSize=1)
+        if not fund.isin:
+            return {"found": False, "error": False, "isin": isin}
+        result: Dict[str, Any] = {
+            "found": True,
+            "error": False,
+            "name": getattr(fund, "name", isin),
+            "isin": fund.isin,
+            "allocation": None,
+            "sectors_equity": None,
+            "sectors_fi": None,
+            "geography": None,
+            "style_box": None,
+            "credit_quality": None,
+            "market_cap": None,
+            "esg_score": None,
+            "holdings": None,
+        }
+
+        # Allocation actions/obligations/cash
+        try:
+            raw = fund.allocationMap()
+
+            # Stocker raw pour debug si activé (jamais en production)
+            if st.session_state.get("FA_DEBUG_MODE", False):
+                if "FA_DEBUG_ALLOC" not in st.session_state:
+                    st.session_state["FA_DEBUG_ALLOC"] = raw
+
+            def _find_alloc_dict(r: dict) -> dict:
+                """Cherche récursivement le premier dict contenant
+                AssetAllocEquity avec une valeur non nulle."""
+                if not isinstance(r, dict):
+                    return {}
+                # Vérifier à la racine
+                if "AssetAllocEquity" in r:
+                    eq = r.get("AssetAllocEquity") or {}
+                    if isinstance(eq, dict) and (
+                        eq.get("netAllocation") or eq.get("longAllocation")
+                    ):
+                        return r
+                # Vérifier une profondeur
+                for v in r.values():
+                    if isinstance(v, dict) and "AssetAllocEquity" in v:
+                        eq = v.get("AssetAllocEquity") or {}
+                        if isinstance(eq, dict) and (
+                            eq.get("netAllocation") or eq.get("longAllocation")
+                        ):
+                            return v
+                return {}
+
+            dv = _find_alloc_dict(raw)
+            ASSET_KEYS = [
+                "AssetAllocEquity", "AssetAllocBond", "AssetAllocCash",
+                "AssetAllocOther", "AssetAllocNotClassified",
+            ]
+            # Essayer netAllocation d'abord
+            alloc: Dict[str, float] = {}
+            for asset_key in ASSET_KEYS:
+                entry = dv.get(asset_key) or {}
+                net = entry.get("netAllocation") if isinstance(entry, dict) else None
+                try:
+                    alloc[asset_key] = float(net) if net is not None else 0.0
+                except (TypeError, ValueError):
+                    alloc[asset_key] = 0.0
+            alloc_sum = sum(alloc.values())
+            # Si netAllocation < 80%, essayer longAllocation
+            if alloc_sum < 80.0 and dv:
+                alloc_long: Dict[str, float] = {}
+                for asset_key in ASSET_KEYS:
+                    entry = dv.get(asset_key) or {}
+                    long_val = entry.get("longAllocation") if isinstance(entry, dict) else None
+                    try:
+                        alloc_long[asset_key] = float(long_val) if long_val is not None else 0.0
+                    except (TypeError, ValueError):
+                        alloc_long[asset_key] = 0.0
+                long_sum = sum(alloc_long.values())
+                if long_sum > alloc_sum:
+                    alloc = alloc_long
+                    alloc_sum = long_sum
+            # Fallback dualViewData si allocationMap toujours vide
+            if alloc_sum < 5.0:
+                dual = raw.get("dualViewData") or {}
+                if not dual:
+                    # chercher dualViewData en profondeur
+                    for v in raw.values():
+                        if isinstance(v, dict) and "marketValueStockNet" in v:
+                            dual = v
+                            break
+                if dual:
+                    eq_val = dual.get("marketValueStockNet") or dual.get("NetEquity") or 0.0
+                    bo_val = dual.get("marketValueBondNet") or dual.get("NetBond") or 0.0
+                    ca_val = dual.get("marketValueCashNet") or dual.get("NetCash") or 0.0
+                    try:
+                        alloc["AssetAllocEquity"] = float(eq_val)
+                        alloc["AssetAllocBond"] = float(bo_val)
+                        alloc["AssetAllocCash"] = float(ca_val)
+                        alloc_sum = sum(alloc.values())
+                    except (TypeError, ValueError):
+                        pass
+            # Dernier recours : signaler l'absence de données
+            if alloc_sum < 5.0:
+                result["allocation"] = None
+                result["allocation_sum"] = 0.0
+            else:
+                result["allocation"] = alloc
+                result["allocation_sum"] = alloc_sum
+        except Exception:
+            pass
+
+        # Secteurs actions et obligations
+        try:
+            sectors = fund.sector()
+            if isinstance(sectors, dict):
+                eq = (sectors.get("EQUITY") or {}).get("fundPortfolio") or {}
+                fi = (sectors.get("FIXEDINCOME") or {}).get("fundPortfolio") or {}
+                result["sectors_equity"] = {
+                    k: float(v) for k, v in eq.items()
+                    if k != "portfolioDate" and isinstance(v, (int, float)) and float(v) > 0
+                }
+                result["sectors_fi"] = {
+                    k: float(v) for k, v in fi.items()
+                    if k != "portfolioDate" and isinstance(v, (int, float)) and float(v) > 0
+                }
+        except Exception:
+            pass
+
+        # Géographie
+        try:
+            geo = fund.regionalSector()
+            fp = geo.get("fundPortfolio") or {}
+            GEO_KEYS = [
+                "northAmerica", "unitedKingdom", "europeDeveloped", "europeEmerging",
+                "africaMiddleEast", "japan", "australasia", "asiaDeveloped",
+                "asiaEmerging", "latinAmerica",
+            ]
+            result["geography"] = {k: float(fp.get(k) or 0.0) for k in GEO_KEYS}
+        except Exception:
+            pass
+
+        # Style box
+        try:
+            sw = fund.allocationWeighting()
+            STYLE_KEYS = [
+                "largeValue", "largeBlend", "largeGrowth",
+                "middleValue", "middleBlend", "middleGrowth",
+                "smallValue", "smallBlend", "smallGrowth",
+            ]
+            result["style_box"] = {k: float(sw.get(k) or 0.0) for k in STYLE_KEYS}
+        except Exception:
+            pass
+
+        # Qualité crédit
+        try:
+            cq = fund.creditQuality()
+            fd = cq.get("fund") or {}
+            CQ_KEYS = [
+                "creditQualityAAA", "creditQualityAA", "creditQualityA", "creditQualityBBB",
+                "creditQualityBB", "creditQualityB", "creditQualityBelowB", "creditQualityNotRated",
+            ]
+            result["credit_quality"] = {k: float(fd.get(k) or 0.0) for k in CQ_KEYS}
+        except Exception:
+            pass
+
+        # Capitalisation boursière
+        try:
+            mc = fund.marketCapitalization()
+            fd = mc.get("fund") or {}
+            result["market_cap"] = {
+                "giant":        float(fd.get("giant") or 0.0),
+                "large":        float(fd.get("large") or 0.0),
+                "medium":       float(fd.get("medium") or 0.0),
+                "small":        float(fd.get("small") or 0.0),
+                "micro":        float(fd.get("micro") or 0.0),
+                "avgMarketCap": float(fd.get("avgMarketCap") or 0.0),
+            }
+        except Exception:
+            pass
+
+        # Score ESG
+        try:
+            esg = fund.esgRisk()
+            score = esg.get("fundSustainabilityScore")
+            if score is not None:
+                result["esg_score"] = float(score)
+        except Exception:
+            pass
+
+        # Holdings top 15
+        try:
+            df_h = fund.holdings(holdingType="all")
+            if df_h is not None:
+                if not isinstance(df_h, pd.DataFrame):
+                    df_h = pd.DataFrame(df_h)
+                if not df_h.empty:
+                    cols = ["securityName", "weighting", "country", "sector", "holdingType", "isin"]
+                    cols_ok = [c for c in cols if c in df_h.columns]
+                    result["holdings"] = df_h[cols_ok].head(15).to_dict("records")
+        except Exception:
+            pass
+
+        return result
+    except Exception:
+        return {"found": False, "error": True, "isin": isin}
+
+
+def aggregate_portfolio_fundamentals(
+    lines: List[Dict[str, Any]],
+    euro_rate: float,
+    fee_pct: float,
+) -> Dict[str, Any]:
+    """Agrège les métriques fondamentales Morningstar de tous les fonds UC du portefeuille."""
+    # 1. Calculer la valeur actuelle de chaque ligne UC
+    line_values: Dict[str, float] = {}
+    for ln in lines:
+        isin = str(ln.get("isin") or "").upper()
+        if isin in ("EUROFUND", "STRUCTURED"):
+            continue
+        buy_ts = pd.Timestamp(ln.get("buy_date"))
+        net_amt, buy_px, qty = compute_line_metrics(ln, fee_pct, euro_rate)
+        dfl, _ = get_series_for_line(ln, buy_ts, euro_rate)
+        if dfl.empty or qty <= 0:
+            continue
+        last_px = float(dfl["Close"].iloc[-1])
+        val = qty * last_px
+        if val > 0:
+            line_id = ln.get("id") or ln.get("isin") or str(id(ln))
+            line_values[line_id] = val
+
+    total_val = sum(line_values.values())
+    if total_val <= 0:
+        return {"covered_pct": 0.0, "not_found": [], "error": "Aucune valeur disponible"}
+
+    # 2. Charger les fondamentaux pour chaque ligne UC
+    fund_data: Dict[str, Any] = {}
+    weights: Dict[str, float] = {}
+    for ln in lines:
+        isin = str(ln.get("isin") or "").upper()
+        if isin in ("EUROFUND", "STRUCTURED"):
+            continue
+        line_id = ln.get("id") or ln.get("isin") or str(id(ln))
+        if line_id not in line_values:
+            continue
+        w = line_values[line_id] / total_val
+        weights[line_id] = w
+        data = _load_fund_fundamentals(isin)
+        fund_data[line_id] = {**data, "line_name": ln.get("name", isin), "weight": w}
+
+    # 3. Calculer covered_pct et not_found
+    covered_weight = sum(
+        weights[lid] for lid, d in fund_data.items() if d.get("found")
+    )
+    not_found = [
+        {"name": d.get("line_name", "—"), "isin": d.get("isin", "—")}
+        for d in fund_data.values()
+        if not d.get("found")
+    ]
+
+    # 4. Agréger chaque dimension (pondération par poids fonds)
+    def _agg(key: str, sub_key: Optional[str] = None) -> Dict[str, float]:
+        result_d: Dict[str, float] = {}
+        total_w = 0.0
+        for lid, d in fund_data.items():
+            if not d.get("found"):
+                continue
+            w = weights.get(lid, 0.0)
+            src = d.get(key) or {}
+            if sub_key:
+                src = src.get(sub_key) or {}
+            if not src:
+                continue
+            for k, v in src.items():
+                try:
+                    result_d[k] = result_d.get(k, 0.0) + float(v) * w
+                except (TypeError, ValueError):
+                    pass
+            total_w += w
+        # Renormaliser si couverture partielle
+        if 0 < total_w < 1.0:
+            result_d = {k: v / total_w for k, v in result_d.items()}
+        return result_d
+
+    allocation_agg = _agg("allocation")
+    sectors_equity_agg = _agg("sectors_equity")
+    sectors_fi_agg = _agg("sectors_fi")
+    geography_agg = _agg("geography")
+    style_box_agg = _agg("style_box")
+    credit_quality_agg = _agg("credit_quality")
+    market_cap_agg = _agg("market_cap")
+
+    # ESG : moyenne pondérée
+    esg_num = 0.0
+    esg_w = 0.0
+    for lid, d in fund_data.items():
+        if d.get("found") and d.get("esg_score") is not None:
+            w = weights.get(lid, 0.0)
+            esg_num += float(d["esg_score"]) * w
+            esg_w += w
+    esg_agg: Optional[float] = (esg_num / esg_w) if esg_w > 0 else None
+
+    # Holdings consolidés : agréger par ISIN ou par nom si ISIN absent
+    holdings_agg: Dict[str, Dict[str, Any]] = {}
+    for lid, d in fund_data.items():
+        if not d.get("found") or not d.get("holdings"):
+            continue
+        w_fund = weights.get(lid, 0.0)
+        for h in d["holdings"]:
+            h_isin = str(h.get("isin") or "").strip()
+            h_name = str(h.get("securityName") or "").strip()
+            h_key = h_isin if h_isin else h_name
+            if not h_key:
+                continue
+            h_weight_in_fund = float(h.get("weighting") or 0.0)
+            contribution = h_weight_in_fund * w_fund / 100.0
+            if h_key in holdings_agg:
+                holdings_agg[h_key]["weight_portfolio"] += contribution
+                if lid not in holdings_agg[h_key]["found_in"]:
+                    holdings_agg[h_key]["found_in"].append(d.get("line_name", lid))
+            else:
+                holdings_agg[h_key] = {
+                    "name": h_name,
+                    "isin": h_isin,
+                    "weight_portfolio": contribution,
+                    "country": h.get("country", ""),
+                    "sector": h.get("sector", ""),
+                    "found_in": [d.get("line_name", lid)],
+                }
+
+    top_holdings = sorted(
+        holdings_agg.values(),
+        key=lambda x: x["weight_portfolio"],
+        reverse=True,
+    )[:20]
+
     return {
-        "perte_uc":          perte_uc,
-        "perte_euro":        perte_euro,
-        "perte_totale":      perte_totale,
-        "valeur_post_choc":  portfolio_value + perte_totale,
-        "pct_perte_total":   (perte_totale / portfolio_value * 100) if portfolio_value > 0 else 0.0,
+        "covered_pct":    covered_weight * 100.0,
+        "not_found":      not_found,
+        "allocation":     allocation_agg,
+        "sectors_equity": sectors_equity_agg,
+        "sectors_fi":     sectors_fi_agg,
+        "geography":      geography_agg,
+        "style_box":      style_box_agg,
+        "credit_quality": credit_quality_agg,
+        "market_cap":     market_cap_agg,
+        "esg_score":      esg_agg,
+        "top_holdings":   top_holdings,
     }
+
+
+def _render_fundamentals_dashboard(agg: Dict[str, Any]) -> None:
+    """Affiche le tableau de bord d'analyse fondamentale agrégée."""
+    # Bandeau couverture
+    cov = agg.get("covered_pct", 0.0)
+    not_found = agg.get("not_found", [])
+    try:
+        if cov >= 80:
+            st.success(f"✅ Couverture Morningstar : {cov:.0f}% du portefeuille analysé")
+        elif cov >= 50:
+            st.warning(f"⚠️ Couverture partielle : {cov:.0f}% du portefeuille analysé")
+        else:
+            st.error(f"❌ Couverture insuffisante : {cov:.0f}% — résultats peu représentatifs")
+        if not_found:
+            nf_list = ", ".join(f"{d['name']} ({d['isin']})" for d in not_found)
+            st.caption(f"Fonds non couverts par Morningstar : {nf_list}")
+    except Exception:
+        pass
+
+    st.markdown("---")
+
+    # ── Section 1 : Allocation d'actifs ──────────────────────────────
+    try:
+        alloc = agg.get("allocation") or {}
+        if alloc:
+            st.subheader("📊 Allocation d'actifs consolidée")
+            _FA_ALLOC_LABELS = {
+                "AssetAllocEquity":         "Actions",
+                "AssetAllocBond":           "Obligations",
+                "AssetAllocCash":           "Cash",
+                "AssetAllocOther":          "Autres",
+                "AssetAllocNotClassified":  "Non classifié",
+            }
+            alloc_display = {
+                _FA_ALLOC_LABELS.get(k, k): v for k, v in alloc.items() if v > 0.5
+            }
+            if alloc_display:
+                cols_alloc = st.columns(len(alloc_display))
+                for i, (label, val) in enumerate(alloc_display.items()):
+                    cols_alloc[i].metric(label, f"{val:.1f}%")
+                # FIXED (P3): note explicative si le total < 95%
+                alloc_total = sum(alloc_display.values())
+                if alloc_total < 95.0:
+                    st.caption(
+                        f"ℹ️ Total affiché : {alloc_total:.1f}% — Les positions nettes "
+                        "(long − short) retournées par Morningstar peuvent ne pas sommer "
+                        "à 100% pour les fonds utilisant des dérivés ou positions synthétiques. "
+                        "Les pourcentages reflètent l'exposition nette réelle de chaque classe d'actif."
+                    )
+            st.markdown("---")
+    except Exception:
+        pass
+
+    # ── Section 2 : Répartition géographique ─────────────────────────
+    try:
+        geo = agg.get("geography") or {}
+        if geo:
+            st.subheader("🌍 Répartition géographique consolidée")
+            _FA_GEO_LABELS = {
+                "northAmerica":     "Amérique du Nord",
+                "europeDeveloped":  "Europe développée",
+                "asiaDeveloped":    "Asie développée",
+                "asiaEmerging":     "Asie émergente",
+                "japan":            "Japon",
+                "latinAmerica":     "Amérique latine",
+                "unitedKingdom":    "Royaume-Uni",
+                "europeEmerging":   "Europe émergente",
+                "africaMiddleEast": "Afrique / Moyen-Orient",
+                "australasia":      "Australasie",
+            }
+            geo_filtered = {
+                _FA_GEO_LABELS.get(k, k): v for k, v in geo.items() if v > 0.5
+            }
+            if geo_filtered:
+                sorted_geo = sorted(geo_filtered.items(), key=lambda x: x[1], reverse=True)
+                _fs_bar_chart(
+                    [x[0] for x in sorted_geo],
+                    [x[1] for x in sorted_geo],
+                    "#2196F3",
+                    "Géographie",
+                )
+            st.markdown("---")
+    except Exception:
+        pass
+
+    # ── Section 3 : Secteurs actions et obligations ───────────────────
+    try:
+        col_sec1, col_sec2 = st.columns(2)
+        with col_sec1:
+            sec_eq = agg.get("sectors_equity") or {}
+            if sec_eq:
+                st.subheader("📈 Secteurs actions")
+                _fs_bar_chart(
+                    [_FS_SECTOR_LABELS.get(k, k) for k in sec_eq],
+                    list(sec_eq.values()),
+                    "#1f77b4",
+                    "Secteurs actions",
+                )
+        with col_sec2:
+            sec_fi = agg.get("sectors_fi") or {}
+            if sec_fi:
+                st.subheader("📉 Secteurs obligations")
+                _fs_bar_chart(
+                    [_FS_FI_LABELS.get(k, k) for k in sec_fi],
+                    list(sec_fi.values()),
+                    "#ff7f0e",
+                    "Secteurs obligations",
+                )
+        st.markdown("---")
+    except Exception:
+        pass
+
+    # ── Section 4 : Top 20 holdings consolidés ───────────────────────
+    try:
+        top_h = agg.get("top_holdings") or []
+        if top_h:
+            st.subheader("🏦 Top 20 positions consolidées")
+            st.caption(
+                "Poids calculé : (poids du holding dans le fonds) × "
+                "(poids du fonds dans le portefeuille). "
+                "Les doublons (même titre dans plusieurs fonds) sont agrégés."
+            )
+            rows_h = [
+                {
+                    "Titre":              h.get("name", "—"),
+                    "ISIN":               h.get("isin", "—"),
+                    "Poids portef. (%)":  round(h["weight_portfolio"] * 100, 3),
+                    "Pays":               h.get("country", "—"),
+                    "Secteur":            h.get("sector", "—"),
+                    "Présent dans":       ", ".join(h.get("found_in", [])),
+                }
+                for h in top_h
+            ]
+            df_top = pd.DataFrame(rows_h)
+            overweight = df_top[df_top["Poids portef. (%)"] > 5.0]
+            if not overweight.empty:
+                names_ow = ", ".join(overweight["Titre"].tolist())
+                st.warning(
+                    f"⚠️ Surconcentration détectée (>5% du portefeuille) : {names_ow}"
+                )
+            st.dataframe(df_top, hide_index=True, use_container_width=True)
+            st.markdown("---")
+    except Exception:
+        pass
+
+    # ── Section 5 : Style box + Capitalisation ────────────────────────
+    try:
+        col_style, col_cap = st.columns(2)
+        with col_style:
+            sb = agg.get("style_box") or {}
+            if sb:
+                st.subheader("🎯 Style box actions")
+                _STYLE_LABELS = {
+                    "largeValue":   "Large Value",  "largeBlend":   "Large Blend",  "largeGrowth":   "Large Growth",
+                    "middleValue":  "Mid Value",    "middleBlend":  "Mid Blend",    "middleGrowth":  "Mid Growth",
+                    "smallValue":   "Small Value",  "smallBlend":   "Small Blend",  "smallGrowth":   "Small Growth",
+                }
+                sb_display = {
+                    _STYLE_LABELS.get(k, k): v for k, v in sb.items() if v > 1.0
+                }
+                if sb_display:
+                    sorted_sb = sorted(sb_display.items(), key=lambda x: x[1], reverse=True)
+                    _fs_bar_chart(
+                        [x[0] for x in sorted_sb],
+                        [x[1] for x in sorted_sb],
+                        "#9C27B0",
+                        "Style box",
+                    )
+        with col_cap:
+            mc = agg.get("market_cap") or {}
+            if mc:
+                st.subheader("📏 Capitalisation boursière")
+                _CAP_LABELS = {
+                    "giant": "Giant", "large": "Large", "medium": "Medium",
+                    "small": "Small", "micro": "Micro",
+                }
+                mc_display = {
+                    _CAP_LABELS.get(k, k): v for k, v in mc.items()
+                    if k != "avgMarketCap" and v > 0.5
+                }
+                if mc_display:
+                    sorted_mc = sorted(mc_display.items(), key=lambda x: x[1], reverse=True)
+                    _fs_bar_chart(
+                        [x[0] for x in sorted_mc],
+                        [x[1] for x in sorted_mc],
+                        "#4CAF50",
+                        "Cap boursière",
+                    )
+                avg = mc.get("avgMarketCap")
+                if avg and avg > 0:
+                    st.caption(f"Capitalisation moyenne pondérée : {avg / 1000:.0f} Md$")
+        st.markdown("---")
+    except Exception:
+        pass
+
+    # ── Section 6 : Qualité crédit ────────────────────────────────────
+    try:
+        cq = agg.get("credit_quality") or {}
+        if cq and sum(cq.values()) > 1.0:
+            st.subheader("🏦 Qualité crédit obligataire")
+            _CQ_LABELS = {
+                "creditQualityAAA":      "AAA",
+                "creditQualityAA":       "AA",
+                "creditQualityA":        "A",
+                "creditQualityBBB":      "BBB",
+                "creditQualityBB":       "BB",
+                "creditQualityB":        "B",
+                "creditQualityBelowB":   "Below B",
+                "creditQualityNotRated": "Non noté",
+            }
+            cq_display = {_CQ_LABELS.get(k, k): v for k, v in cq.items() if v > 0.5}
+            if cq_display:
+                sorted_cq = sorted(cq_display.items(), key=lambda x: x[1], reverse=True)
+                _fs_bar_chart(
+                    [x[0] for x in sorted_cq],
+                    [x[1] for x in sorted_cq],
+                    "#FF5722",
+                    "Qualité crédit",
+                )
+    except Exception:
+        pass
+
+    # ── Section 7 : Score ESG agrégé ──────────────────────────────────
+    try:
+        esg = agg.get("esg_score")
+        if esg is not None:
+            st.markdown("---")
+            st.subheader("🌱 Score ESG agrégé (Morningstar Sustainalytics)")
+            if esg <= 10:
+                esg_cat = "Négligeable"
+            elif esg <= 20:
+                esg_cat = "Faible"
+            elif esg <= 30:
+                esg_cat = "Moyen"
+            elif esg <= 40:
+                esg_cat = "Élevé"
+            else:
+                esg_cat = "Sévère"
+            ec1, ec2 = st.columns([1, 3])
+            ec1.metric("Score ESG moyen pondéré", f"{esg:.1f}")
+            ec2.caption(
+                f"Catégorie de risque : {esg_cat}\n\n"
+                "Score calculé par moyenne pondérée des scores ESG "
+                "Sustainalytics de chaque fonds."
+            )
+    except Exception:
+        pass
 
 
 def run_comparator():
@@ -8100,32 +6694,57 @@ def _fmt_eur(v: float) -> str:
 
 
 def _tab_rachat() -> None:
-    # ── Données du contrat — lues depuis le Tableau de bord ──────────
-    _date_ouv_r = st.session_state.get("tax_date_ouverture", date(2016, 1, 2))
-    anciennete_annees = (date.today() - _date_ouv_r).days / 365.25
-    valeur_contrat = float(st.session_state.get("tax_valeur_contrat", 100_000.0))
-    versements_nets = float(st.session_state.get("tax_versements_nets", 80_000.0))
-    versements_nets_total = float(st.session_state.get("tax_versements_nets_total", 80_000.0))
-    situation_familiale = st.session_state.get("tax_situation_familiale", "Célibataire / veuf / divorcé")
+    with st.expander("Paramètres du contrat", expanded=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            date_ouverture = st.date_input(
+                "Date d'ouverture du contrat",
+                value=st.session_state.get("tax_date_ouverture", date(2016, 1, 2)),
+                key="tax_date_ouverture",
+            )
+            anciennete_jours = (date.today() - date_ouverture).days
+            anciennete_annees = anciennete_jours / 365.25
+            st.caption(f"Ancienneté : **{anciennete_annees:.1f} ans**")
 
-    with st.container(border=True):
-        _ri1, _ri2, _ri3 = st.columns(3)
-        with _ri1:
-            st.metric("Valeur du contrat", to_eur(valeur_contrat))
-        with _ri2:
-            st.metric("Versements nets", to_eur(versements_nets))
-        with _ri3:
-            _anc_disp = anciennete_annees
-            st.metric("Ancienneté", f"{_anc_disp:.1f} ans")
-        st.caption(f"📅 Ouverture : **{_date_ouv_r.strftime('%d/%m/%Y')}** | Situation : **{situation_familiale}** — _modifiez dans le 📋 Tableau de bord_")
+            valeur_contrat = st.number_input(
+                "Valeur actuelle du contrat (€)",
+                min_value=0.0, max_value=10_000_000.0,
+                value=float(st.session_state.get("tax_valeur_contrat", 100_000.0)),
+                step=1_000.0, key="tax_valeur_contrat",
+            )
+            versements_nets = st.number_input(
+                "Total versements nets (€)",
+                min_value=0.0,
+                max_value=float(max(valeur_contrat, 0.01)),
+                value=float(min(
+                    st.session_state.get("tax_versements_nets", 80_000.0),
+                    max(valeur_contrat, 0.0),
+                )),
+                step=1_000.0, key="tax_versements_nets",
+                help="Versements bruts − rachats antérieurs en capital",
+            )
+        with c2:
+            versements_nets_total = st.number_input(
+                "Total versements nets tous contrats (pour seuil 150k€) (€)",
+                min_value=0.0, max_value=10_000_000.0,
+                value=float(st.session_state.get("tax_versements_nets_total", 80_000.0)),
+                step=1_000.0, key="tax_versements_nets_total",
+                help="Utilisé pour déterminer si le taux IR est 7,5% ou 12,8% sur les contrats ≥8 ans avec versements post-27/09/2017",
+            )
+            situation_familiale = st.radio(
+                "Situation familiale",
+                ["Célibataire / veuf / divorcé", "Couple (imposition commune)"],
+                key="tax_situation_familiale",
+                horizontal=False,
+            )
+            ps_deja_preleves = st.number_input(
+                "PS déjà prélevés sur fonds euros (€)",
+                min_value=0.0, max_value=100_000.0,
+                value=0.0, step=100.0,
+                help="Sur les fonds en euros, les PS sont prélevés chaque année par l'assureur. Indiquez le cumul déjà prélevé pour éviter de les recompter au rachat.",
+            )
 
-    ps_deja_preleves = st.number_input(
-        "PS déjà prélevés sur fonds euros (€)",
-        min_value=0.0, max_value=100_000.0,
-        value=0.0, step=100.0,
-        key="tax_ps_deja_preleves",
-        help="Sur les fonds en euros, les PS sont prélevés chaque année par l'assureur.",
-    )
+    st.markdown("---")
     st.markdown("#### Montant du rachat")
 
     # Synchronisation brut ↔ net via session_state
@@ -8232,78 +6851,6 @@ def _tab_rachat() -> None:
                 f"uniquement {_fmt_eur(ps_limite)} de PS."
             )
 
-        # ── Graphiques : Donut décomposition + Waterfall ──────────
-        _capital_restitue = montant_brut - gains
-        _gains_exoneres = min(gains, result["abattement_applique"])
-        _gains_taxes_net = max(0.0, gains - result["abattement_applique"])
-        _ir_chart = result["montant_ir"]
-        _ps_net_chart = max(0.0, result["montant_ps"] - ps_deja_preleves)
-        _net_chart = montant_brut - _ir_chart - _ps_net_chart
-
-        _donut_rows = [
-            {"Composante": "Capital restitué (non taxé)", "Montant": _capital_restitue},
-            {"Composante": "Gains exonérés (abattement)", "Montant": _gains_exoneres},
-            {"Composante": "Impôt sur le revenu", "Montant": _ir_chart},
-            {"Composante": "Prélèvements sociaux", "Montant": _ps_net_chart},
-        ]
-        _donut_df = pd.DataFrame([r for r in _donut_rows if r["Montant"] > 0.5])
-
-        if not _donut_df.empty:
-            _dc1, _dc2 = st.columns(2)
-            with _dc1:
-                _donut_chart = (
-                    alt.Chart(_donut_df)
-                    .mark_arc(innerRadius=55, outerRadius=105)
-                    .encode(
-                        theta=alt.Theta("Montant:Q"),
-                        color=alt.Color(
-                            "Composante:N",
-                            scale=alt.Scale(
-                                domain=["Capital restitué (non taxé)", "Gains exonérés (abattement)",
-                                        "Impôt sur le revenu", "Prélèvements sociaux"],
-                                range=["#2E7D32", "#81C784", "#E53935", "#EF9A9A"],
-                            ),
-                            legend=alt.Legend(title="", orient="bottom"),
-                        ),
-                        tooltip=[
-                            alt.Tooltip("Composante:N"),
-                            alt.Tooltip("Montant:Q", format=",.0f", title="€"),
-                        ],
-                    )
-                    .properties(height=280, title="Décomposition du rachat")
-                )
-                st.altair_chart(_donut_chart, use_container_width=True)
-
-            with _dc2:
-                _wf_data = pd.DataFrame([
-                    {"Étape": "Rachat brut", "Montant": montant_brut, "Type": "Base"},
-                    {"Étape": "− IR", "Montant": -_ir_chart, "Type": "Impôt"},
-                    {"Étape": "− PS", "Montant": -_ps_net_chart, "Type": "Impôt"},
-                    {"Étape": "Net perçu", "Montant": _net_chart, "Type": "Net"},
-                ])
-                _wf_chart = (
-                    alt.Chart(_wf_data)
-                    .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                    .encode(
-                        x=alt.X("Étape:N", sort=None, axis=alt.Axis(labelAngle=0), title=""),
-                        y=alt.Y("Montant:Q", axis=alt.Axis(format=",.0f"), title="€"),
-                        color=alt.Color(
-                            "Type:N",
-                            scale=alt.Scale(
-                                domain=["Base", "Impôt", "Net"],
-                                range=["#1B2A4A", "#E53935", "#2E7D32"],
-                            ),
-                            legend=None,
-                        ),
-                        tooltip=[
-                            alt.Tooltip("Étape:N"),
-                            alt.Tooltip("Montant:Q", format=",.0f", title="€"),
-                        ],
-                    )
-                    .properties(height=280, title="Brut → Net")
-                )
-                st.altair_chart(_wf_chart, use_container_width=True)
-
 
 def _tab_optimisation_abattement() -> None:
     st.markdown("#### Optimisation de l'abattement annuel")
@@ -8313,28 +6860,49 @@ def _tab_optimisation_abattement() -> None:
         "pour 'purger' les plus-values progressivement sans payer d'IR."
     )
 
-    # ── Données lues depuis le Tableau de bord ──────────────────
-    _date_ouv_o = st.session_state.get("tax_date_ouverture", date(2016, 1, 2))
-    anc2 = (date.today() - _date_ouv_o).days / 365.25
-    valeur2 = float(st.session_state.get("tax_valeur_contrat", 100_000.0))
-    versements2 = float(st.session_state.get("tax_versements_nets", 80_000.0))
-    versements_total2 = float(st.session_state.get("tax_versements_nets_total", 80_000.0))
-    sit2 = st.session_state.get("tax_situation_familiale", "Célibataire / veuf / divorcé")
+    c1, c2 = st.columns(2)
+    with c1:
+        date_ouv2 = st.date_input(
+            "Date d'ouverture du contrat",
+            value=st.session_state.get("tax_date_ouverture", date(2016, 1, 2)),
+            key="tax_opt_date_ouverture",
+        )
+        anc2 = (date.today() - date_ouv2).days / 365.25
+        st.caption(f"Ancienneté : **{anc2:.1f} ans**")
 
-    with st.container(border=True):
-        _oi1, _oi2, _oi3 = st.columns(3)
-        _oi1.metric("Valeur du contrat", to_eur(valeur2))
-        _oi2.metric("Versements nets", to_eur(versements2))
-        _oi3.metric("Ancienneté", f"{anc2:.1f} ans")
-        st.caption(f"Situation : **{sit2}** — _modifiez dans le 📋 Tableau de bord_")
+        valeur2 = st.number_input(
+            "Valeur actuelle du contrat (€)",
+            min_value=0.0, max_value=10_000_000.0,
+            value=float(st.session_state.get("tax_valeur_contrat", 100_000.0)),
+            step=1_000.0, key="tax_opt_valeur",
+        )
+        versements2 = st.number_input(
+            "Total versements nets (€)",
+            min_value=0.0, max_value=float(max(valeur2, 0.01)),
+            value=float(min(st.session_state.get("tax_versements_nets", 80_000.0), max(valeur2, 0.0))),
+            step=1_000.0, key="tax_opt_versements",
+        )
+    with c2:
+        sit2 = st.radio(
+            "Situation familiale",
+            ["Célibataire / veuf / divorcé", "Couple (imposition commune)"],
+            key="tax_opt_situation",
+        )
+        versements_total2 = st.number_input(
+            "Total versements nets tous contrats (€)",
+            min_value=0.0, max_value=10_000_000.0,
+            value=float(st.session_state.get("tax_versements_nets_total", 80_000.0)),
+            step=1_000.0, key="tax_opt_versements_total",
+        )
+        abat_deja = st.number_input(
+            "Abattement déjà utilisé cette année sur d'autres contrats (€)",
+            min_value=0.0, max_value=9_200.0,
+            value=float(st.session_state.get("tax_abattement_deja_utilise", 0.0)),
+            step=100.0, key="tax_abattement_deja_utilise",
+            help="L'abattement de 4 600€/9 200€ est global tous contrats AV. Indiquez ce qui a déjà été consommé.",
+        )
 
-    abat_deja = st.number_input(
-        "Abattement déjà utilisé cette année sur d'autres contrats (€)",
-        min_value=0.0, max_value=9_200.0,
-        value=float(st.session_state.get("tax_abattement_deja_utilise", 0.0)),
-        step=100.0, key="tax_abattement_deja_utilise",
-        help="L'abattement de 4 600€/9 200€ est global tous contrats AV.",
-    )
+    st.markdown("---")
 
     if anc2 < 8:
         st.warning(
@@ -8433,27 +7001,44 @@ def _tab_transmission() -> None:
             )
 
     st.markdown("---")
+    nb_benef = int(st.number_input(
+        "Nombre de bénéficiaires",
+        min_value=1, max_value=5,
+        value=int(st.session_state.get("tax_nb_beneficiaires", 2)),
+        step=1, key="tax_nb_beneficiaires",
+    ))
 
-    # ── Lire les bénéficiaires depuis le Tableau de bord ──────────
-    _benef_data_t = st.session_state.get("tax_dash_beneficiaires", [])
-    if not _benef_data_t:
-        st.warning("⚠️ Renseignez les bénéficiaires dans l'onglet 📋 Tableau de bord.")
-        return
+    noms, types_benef, parts_pct, liens_succ = [], [], [], []
+    TYPES_OPTS = [
+        "Conjoint/PACS", "Enfant", "Frère/Sœur", "Neveu/Nièce",
+        "Tiers", "Démembré - Usufruitier", "Démembré - Nu-propriétaire",
+    ]
+    LIENS_OPTS = ["Conjoint/PACS", "Enfant", "Frère/Sœur", "Neveu/Nièce", "Tiers"]
 
-    nb_benef = len(_benef_data_t)
-    noms = [b.get("nom", "") for b in _benef_data_t]
-    types_benef = [b.get("type", "Enfant") for b in _benef_data_t]
-    parts_pct = [float(b.get("part", 100.0 / nb_benef)) for b in _benef_data_t]
-    liens_succ = [b.get("type", "Enfant") for b in _benef_data_t]
-    # Mapper les types AV vers liens succession
-    _lien_map = {
-        "Conjoint/PACS": "Conjoint/PACS",
-        "Enfant": "Enfant",
-        "Frère/Sœur": "Frère/Sœur",
-        "Neveu/Nièce": "Neveu/Nièce",
-        "Tiers": "Tiers",
-    }
-    liens_succ = [_lien_map.get(t, "Enfant") for t in types_benef]
+    for i in range(nb_benef):
+        with st.expander(f"Bénéficiaire {i + 1}", expanded=(i == 0)):
+            bc1, bc2, bc3 = st.columns([2, 2, 1])
+            with bc1:
+                nom = st.text_input("Nom / prénom (facultatif)", key=f"tax_benef_nom_{i}")
+            with bc2:
+                t = st.selectbox("Lien avec l'assuré", TYPES_OPTS, key=f"tax_benef_type_{i}")
+            with bc3:
+                p = st.number_input(
+                    "Quote-part (%)",
+                    min_value=0.0, max_value=100.0,
+                    value=round(100.0 / nb_benef, 0),
+                    step=5.0, key=f"tax_benef_part_{i}",
+                )
+            lien_succ = st.selectbox(
+                "Lien de parenté (pour droits de succession 757B)",
+                LIENS_OPTS,
+                index=LIENS_OPTS.index("Enfant") if "Enfant" in t else 0,
+                key=f"tax_benef_lien_{i}",
+            )
+            noms.append(nom)
+            types_benef.append(t)
+            parts_pct.append(float(p))
+            liens_succ.append(lien_succ)
 
     total_parts = sum(parts_pct)
     if abs(total_parts - 100.0) > 0.5:
@@ -8627,86 +7212,8 @@ def _tab_exoneration() -> None:
     )
 
 
-def _tab_rente_viagere() -> None:
-    """Simulation de transformation du capital en rente viagère."""
-    st.markdown("#### Simulation — Sortie en rente viagère")
-    st.info(
-        "La rente viagère issue d'un contrat d'assurance-vie bénéficie d'une "
-        "fiscalité allégée. Seule une fraction de la rente est imposable à l'IR, "
-        "selon l'âge au moment de la mise en rente (Art. 158-6 CGI)."
-    )
-    # Fractions imposables selon l'âge (Art. 158-6 CGI)
-    _FRACTIONS_IMPOSABLES = {
-        "Moins de 50 ans":     0.70,
-        "50 à 59 ans":         0.50,
-        "60 à 69 ans":         0.40,
-        "70 ans et plus":      0.30,
-    }
-    _rc1, _rc2 = st.columns(2)
-    with _rc1:
-        _capital_rente = st.number_input(
-            "Capital à convertir en rente (€)",
-            min_value=0.0, max_value=5_000_000.0,
-            value=200_000.0, step=5_000.0, key="rente_capital",
-        )
-        _taux_rente_annuel = st.number_input(
-            "Taux de conversion annuel estimé (%)",
-            min_value=1.0, max_value=10.0,
-            value=4.5, step=0.1, key="rente_taux",
-            help="Dépend de l'âge, du sexe et de la table de mortalité de l'assureur. "
-                 "Typiquement 4-6% pour un rentier de 65 ans.",
-        )
-    with _rc2:
-        _tranche_age = st.selectbox(
-            "Tranche d'âge au moment de la mise en rente",
-            list(_FRACTIONS_IMPOSABLES.keys()),
-            index=2,  # 60-69 ans par défaut
-            key="rente_age",
-        )
-        _tmi = st.selectbox(
-            "Taux marginal d'imposition (TMI)",
-            [0.11, 0.30, 0.41, 0.45],
-            index=1,
-            format_func=lambda x: f"{x*100:.0f}%",
-            key="rente_tmi",
-        )
-    _rente_brute_annuelle = _capital_rente * (_taux_rente_annuel / 100.0)
-    _rente_brute_mensuelle = _rente_brute_annuelle / 12.0
-    _fraction_imposable = _FRACTIONS_IMPOSABLES[_tranche_age]
-    _base_ir = _rente_brute_annuelle * _fraction_imposable
-    _ir_annuel = _base_ir * _tmi
-    _ps_annuel = _base_ir * 0.172  # PS à 17,2%
-    _rente_nette_annuelle = _rente_brute_annuelle - _ir_annuel - _ps_annuel
-    _rente_nette_mensuelle = _rente_nette_annuelle / 12.0
-    _taux_prelevement_effectif = (_ir_annuel + _ps_annuel) / _rente_brute_annuelle if _rente_brute_annuelle > 0 else 0.0
-    st.markdown("---")
-    _rm1, _rm2, _rm3, _rm4 = st.columns(4)
-    _rm1.metric("Rente brute mensuelle", f"{_rente_brute_mensuelle:,.0f} €")
-    _rm2.metric("Rente nette mensuelle", f"{_rente_nette_mensuelle:,.0f} €")
-    _rm3.metric("Fraction imposable", f"{_fraction_imposable*100:.0f}%")
-    _rm4.metric("Taux réel de prélèvement", f"{_taux_prelevement_effectif*100:.1f}%")
-    st.markdown("---")
-    _detail_rows = [
-        ("Rente brute annuelle", f"{_rente_brute_annuelle:,.0f} €"),
-        (f"Fraction imposable ({_fraction_imposable*100:.0f}%)", f"{_base_ir:,.0f} €"),
-        (f"IR ({_tmi*100:.0f}% × fraction imposable)", f"−{_ir_annuel:,.0f} €"),
-        ("Prélèvements sociaux (17,2% × fraction imposable)", f"−{_ps_annuel:,.0f} €"),
-        ("Rente nette annuelle", f"{_rente_nette_annuelle:,.0f} €"),
-        ("Rente nette mensuelle", f"{_rente_nette_mensuelle:,.0f} €"),
-    ]
-    st.dataframe(
-        pd.DataFrame(_detail_rows, columns=["", "Montant"]),
-        hide_index=True, use_container_width=True,
-    )
-    st.caption(
-        "⚠️ Simulation indicative. Le taux de conversion réel dépend de la table de mortalité "
-        "TGH05/TGF05, du type de rente (simple, réversible, avec annuités garanties) et de "
-        "l'assureur. Consultez un conseiller pour un chiffrage personnalisé."
-    )
-
-
 def render_tax_module() -> None:
-    """Module Fiscalité & Avantages AV — entièrement autonome."""
+    """Module Fiscalité assurance-vie — entièrement autonome."""
     # Constantes fiscales (locales, non globales)
     PS_RATE            = 0.172
     PFU_RATE           = 0.128
@@ -8738,837 +7245,557 @@ def render_tax_module() -> None:
     st.session_state.setdefault("tax_abattement_deja_utilise", 0.0)
     st.session_state.setdefault("tax_nb_annees", 10)
 
-    st.title("Fiscalité & Avantages de l'assurance-vie")
+    st.title("Fiscalité assurance-vie")
     st.warning(
         "⚠️ Simulation indicative à titre pédagogique. Ne constitue pas un conseil "
-        "fiscal ou juridique. Consultez un professionnel pour toute décision."
+        "fiscal ou juridique. Les résultats dépendent de la situation personnelle "
+        "de chaque client. Consultez un professionnel fiscaliste pour toute décision."
     )
 
-    # ── Sélecteur de portefeuille ──────────────────────────────────
-    _has_A = bool(st.session_state.get("A_lines", []))
-    _has_B = bool(st.session_state.get("B_lines", []))
-    _options_pf = []
-    if _has_A:
-        _options_pf.append("🧍 Portefeuille Client")
-    if _has_B:
-        _options_pf.append("🏢 Portefeuille Cabinet")
-    if not _options_pf:
-        _options_pf = ["🧍 Portefeuille Client"]
-
-    _selected_pf = st.radio(
-        "Portefeuille analysé",
-        _options_pf,
-        horizontal=True,
-        key="tax_portfolio_selector",
-    )
-    _is_client = "Client" in _selected_pf
-    st.session_state["tax_is_client"] = _is_client
-
-    # ── Synchronisation depuis le comparateur ──────────────────────
-    if _is_client:
-        _sync_val = float(st.session_state.get("_LAST_VAL_A", 0.0) or 0.0)
-        _sync_net = float(st.session_state.get("_LAST_NET_A", 0.0) or 0.0)
-        _sync_xirr = st.session_state.get("_LAST_XIRR_A")
-        _sync_contract = st.session_state.get("CONTRACT_LABEL_A", "")
-        _sync_euro_rate = float(st.session_state.get("EURO_RATE_A", 2.0))
-    else:
-        _sync_val = float(st.session_state.get("_LAST_VAL_B", 0.0) or 0.0)
-        _sync_net = float(st.session_state.get("_LAST_NET_B", 0.0) or 0.0)
-        _sync_xirr = st.session_state.get("_LAST_XIRR_B")
-        _sync_contract = st.session_state.get("CONTRACT_LABEL_B", "")
-        _sync_euro_rate = float(st.session_state.get("EURO_RATE_B", 2.5))
-
-    if _sync_val > 0:
-        st.session_state["tax_valeur_contrat"] = _sync_val
-        st.session_state["tax_capital_deces"] = _sync_val
-    if _sync_net > 0:
-        st.session_state["tax_versements_nets"] = _sync_net
-        st.session_state["tax_versements_nets_total"] = _sync_net
-
-    st.session_state["_tax_sync_contract"] = _sync_contract
-    st.session_state["_tax_sync_xirr"] = _sync_xirr
-    st.session_state["_tax_sync_euro_rate"] = _sync_euro_rate
-
-    tab_dashboard, tab_retrait, tab_transmission_v2, tab_avantages = st.tabs([
-        "📋 Tableau de bord",
-        "💶 Je veux retirer de l'argent",
-        "🏠 Je veux transmettre",
-        "⚖️ Pourquoi l'assurance-vie ?",
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Rachat",
+        "Optimisation abattement",
+        "Transmission / Décès",
+        "Cas d'exonération",
     ])
-
-    with tab_dashboard:
-        _tab_dashboard_fiscal()
-    with tab_retrait:
-        _tab_retrait_wrapper()
-    with tab_transmission_v2:
-        _tab_transmission_v2()
-    with tab_avantages:
-        _tab_avantages_av()
-
-    st.markdown("---")
-    with st.expander("📖 Cas d'exonération & Sortie en rente", expanded=False):
-        _ex1, _ex2 = st.tabs(["Cas d'exonération", "Sortie en rente"])
-        with _ex1:
-            _tab_exoneration()
-        with _ex2:
-            _tab_rente_viagere()
-
-
-def _tab_dashboard_fiscal():
-    """Hub central : infos contrat + situation perso + bénéficiaires + frise."""
-    st.markdown("#### 📋 Votre contrat en un coup d'œil")
-
-    _c1, _c2 = st.columns(2)
-    with _c1:
-        _contract = st.session_state.get("_tax_sync_contract", "") or st.session_state.get("CONTRACT_LABEL_A", "")
-        if _contract:
-            st.markdown(f"**Contrat** : {_contract}")
-        _date_ouv = st.date_input(
-            "Date d'ouverture du contrat",
-            value=st.session_state.get("tax_date_ouverture", date(2016, 1, 2)),
-            key="tax_dash_date_ouverture",
-            help="Date réelle d'ouverture du contrat.",
-        )
-        st.session_state["tax_date_ouverture"] = _date_ouv
-
-        _sit_fam = st.selectbox(
-            "Situation familiale",
-            ["Célibataire / veuf / divorcé", "Marié / pacsé"],
-            key="tax_dash_situation_familiale",
-        )
-        st.session_state["tax_situation_familiale"] = _sit_fam
-
-        _age = st.number_input(
-            "Âge du souscripteur",
-            min_value=18, max_value=100, value=55, step=1,
-            key="tax_age_souscripteur",
-        )
-
-        _tmi = st.selectbox(
-            "Taux marginal d'imposition (TMI)",
-            [0.0, 0.11, 0.30, 0.41, 0.45],
-            index=2,
-            format_func=lambda x: f"{int(x*100)}%",
-            key="tax_tmi",
-            help="Taux marginal de l'IR. Utilisé pour estimer les économies fiscales.",
-        )
-
-    with _c2:
-        _val = float(st.session_state.get("tax_valeur_contrat", 100_000.0))
-        _net = float(st.session_state.get("tax_versements_nets", 80_000.0))
-        _pv = _val - _net
-        _pv_pct = (_pv / _net * 100) if _net > 0 else 0
-        _xirr = st.session_state.get("_tax_sync_xirr")
-
-        st.metric("Valeur actuelle du contrat", to_eur(_val))
-        st.metric("Versements nets", to_eur(_net))
-        st.metric("Plus-values latentes", to_eur(_pv), delta=f"{_pv_pct:+.1f}%")
-        if _xirr is not None:
-            st.metric("Rendement annualisé (XIRR)", f"{float(_xirr):+.2f}%")
-
-    # ── Frise chronologique maturité fiscale ──
-    st.markdown("---")
-    _anciennete = (_date_ouv.toordinal() - date.today().toordinal()) * -1 / 365.25
-    _anciennete = max(0.0, _anciennete)
-    _ans = int(_anciennete)
-    _mois = int((_anciennete - _ans) * 12)
-
-    # Frise simple via Altair
-    _ouv_ts = pd.Timestamp(_date_ouv)
-    _today_ts = pd.Timestamp(date.today())
-    _4ans_ts = _ouv_ts + pd.DateOffset(years=4)
-    _8ans_ts = _ouv_ts + pd.DateOffset(years=8)
-    _12ans_ts = _ouv_ts + pd.DateOffset(years=12)
-
-    _frise_pts = pd.DataFrame([
-        {"label": "Ouverture", "date": _ouv_ts, "type": "jalon"},
-        {"label": "4 ans", "date": _4ans_ts, "type": "jalon"},
-        {"label": "8 ans (maturité)", "date": _8ans_ts, "type": "jalon_majeur"},
-    ])
-    _aujourd_hui_df = pd.DataFrame([
-        {"label": "Aujourd'hui", "date": _today_ts, "type": "position"},
-    ])
-
-    _pos_color = "#2E7D32" if _anciennete >= 8 else ("#FF8F00" if _anciennete >= 4 else "#C62828")
-
-    _rule_df = pd.DataFrame({"x": [_ouv_ts], "x2": [_12ans_ts], "y": [0.5]})
-    _rule = (
-        alt.Chart(_rule_df)
-        .mark_rule(strokeWidth=3, color="#CCCCCC")
-        .encode(x=alt.X("x:T"), x2="x2:T", y=alt.value(40))
-    )
-
-    _pts = (
-        alt.Chart(_frise_pts)
-        .mark_point(size=120, filled=True, color="#1B2A4A")
-        .encode(
-            x=alt.X("date:T", axis=alt.Axis(format="%Y", title="")),
-            y=alt.value(40),
-            tooltip=["label:N", alt.Tooltip("date:T", format="%d/%m/%Y")],
-        )
-    )
-    _lbl = (
-        alt.Chart(_frise_pts)
-        .mark_text(dy=-18, fontSize=11, fontWeight="bold", color="#1B2A4A")
-        .encode(x="date:T", y=alt.value(40), text="label:N")
-    )
-    _pos_pt = (
-        alt.Chart(_aujourd_hui_df)
-        .mark_point(size=200, filled=True, shape="triangle-down")
-        .encode(
-            x="date:T",
-            y=alt.value(40),
-            color=alt.value(_pos_color),
-            tooltip=["label:N"],
-        )
-    )
-    _pos_lbl = (
-        alt.Chart(_aujourd_hui_df)
-        .mark_text(dy=20, fontSize=11, fontWeight="bold")
-        .encode(x="date:T", y=alt.value(40), text="label:N", color=alt.value(_pos_color))
-    )
-
-    _frise_chart = (_rule + _pts + _lbl + _pos_pt + _pos_lbl).properties(height=80, width="container").configure_view(strokeOpacity=0)
-    st.altair_chart(_frise_chart, use_container_width=True)
-
-    # ── Statut de maturité ──
-    if _anciennete >= 8:
-        _emoji_mat, _label_mat = "🟢", "Maturité fiscale atteinte"
-        _abat = "9 200 €" if ("Marié" in _sit_fam or "pacsé" in _sit_fam) else "4 600 €"
-        _detail = (
-            f"Contrat de **{_ans} ans {_mois} mois** — Régime fiscal optimal. "
-            f"Abattement annuel de **{_abat}** sur les gains en cas de rachat. "
-            f"Taux réduit de 7,5% (PFL) pour les versements ≤ 150 000 €."
-        )
-    elif _anciennete >= 4:
-        _restant = 8 - _anciennete
-        _r_ans, _r_mois = int(_restant), int((_restant - int(_restant)) * 12) + 1
-        _emoji_mat, _label_mat = "🟠", "Maturité en cours"
-        _detail = (
-            f"Contrat de **{_ans} ans {_mois} mois** — Maturité fiscale dans "
-            f"**{_r_ans} an(s) {_r_mois} mois**. Rachats soumis au PFU 30% en attendant."
-        )
-    else:
-        _restant = 8 - _anciennete
-        _r_ans, _r_mois = int(_restant), int((_restant - int(_restant)) * 12) + 1
-        _emoji_mat, _label_mat = "🔴", "Contrat récent"
-        _detail = (
-            f"Contrat de **{_ans} ans {_mois} mois** — Flat tax 30% sur les rachats. "
-            f"Maturité fiscale dans **{_r_ans} ans {_r_mois} mois**."
-        )
-    st.markdown(f"### {_emoji_mat} {_label_mat}")
-    st.markdown(_detail)
-
-    # ── Situation familiale & Clause bénéficiaire ──
-    st.markdown("---")
-    st.markdown("#### 👨‍👩‍👧‍👦 Situation familiale & Clause bénéficiaire")
-
-    _fc1, _fc2 = st.columns(2)
-    with _fc1:
-        _nb_enfants = st.number_input(
-            "Nombre d'enfants",
-            min_value=0, max_value=10,
-            value=int(st.session_state.get("tax_nb_enfants", 2)),
-            step=1, key="tax_nb_enfants",
-            help="Pour le calcul des droits de succession classique (abattement 100 000€ par enfant).",
-        )
-    with _fc2:
-        _nb_benef = st.number_input(
-            "Nombre de bénéficiaires (clause AV)",
-            min_value=1, max_value=5,
-            value=int(st.session_state.get("tax_nb_beneficiaires", 2)),
-            step=1, key="tax_nb_beneficiaires",
-        )
-
-    _TYPES_BENEF = ["Conjoint/PACS", "Enfant", "Frère/Sœur", "Neveu/Nièce", "Tiers"]
-    _benef_data = []
-    for i in range(int(_nb_benef)):
-        with st.expander(f"Bénéficiaire {i + 1}", expanded=(i == 0)):
-            _bc1, _bc2, _bc3 = st.columns([2, 2, 1])
-            with _bc1:
-                _nom = st.text_input("Nom (facultatif)", key=f"tax_dash_benef_nom_{i}", value=st.session_state.get(f"tax_dash_benef_nom_{i}", ""))
-            with _bc2:
-                _type = st.selectbox("Lien", _TYPES_BENEF, key=f"tax_dash_benef_type_{i}")
-            with _bc3:
-                _part = st.number_input(
-                    "Quote-part %", min_value=0.0, max_value=100.0,
-                    value=round(100.0 / int(_nb_benef), 0), step=5.0,
-                    key=f"tax_dash_benef_part_{i}",
-                )
-            _benef_data.append({"nom": _nom, "type": _type, "part": float(_part)})
-
-    st.session_state["tax_dash_beneficiaires"] = _benef_data
-
-    _total_parts = sum(b["part"] for b in _benef_data)
-    if abs(_total_parts - 100.0) > 0.5:
-        st.error(f"⚠️ La somme des quotes-parts est {_total_parts:.1f}% — elle doit être égale à 100%.")
-
-    # ── Transmission en bref ──
-    st.markdown("---")
-    st.markdown("#### 🏠 Transmission — En bref")
-    if _age < 70:
-        _abat_trans = 152_500 * int(_nb_benef)
-        st.success(
-            f"✅ Vous avez moins de 70 ans — **Art. 990I** : **{to_eur(152_500)}** "
-            f"exonérés par bénéficiaire. Avec **{int(_nb_benef)} bénéficiaire(s)**, "
-            f"jusqu'à **{to_eur(_abat_trans)}** transmis hors succession."
-        )
-        _marge = _abat_trans - _val
-        if _marge > 0:
-            st.info(f"💡 Marge de versement avant plafond d'exonération : **{to_eur(_marge)}**")
-    else:
-        st.warning(
-            "⚠️ Après 70 ans — **Art. 757B** : abattement global de **30 500 €**. "
-            "Les **intérêts et plus-values** restent exonérés de droits de succession."
-        )
-
-
-def _tab_retrait_wrapper():
-    """Regroupe : combien je paie / combien je peux retirer sans impôt / dois-je attendre."""
-    st.markdown("#### 💶 Retirer de l'argent — Simulateur de rachat")
-
-    _q1, _q2, _q3 = st.tabs([
-        "Combien je paie si je retire X€ ?",
-        "Combien puis-je retirer sans impôt ?",
-        "Ai-je intérêt à attendre ?",
-    ])
-
-    with _q1:
+    with tab1:
         _tab_rachat()
-
-    with _q2:
+    with tab2:
         _tab_optimisation_abattement()
-
-    with _q3:
-        _date_ouv_att = st.session_state.get("tax_date_ouverture", date(2016, 1, 2))
-        _anciennete_att = (date.today() - _date_ouv_att).days / 365.25
-
-        if _anciennete_att >= 8:
-            st.success(
-                "✅ Votre contrat a déjà atteint sa maturité fiscale (>8 ans). "
-                "Aucun intérêt fiscal à attendre davantage pour effectuer un rachat."
-            )
-        else:
-            _restant_att = 8 - _anciennete_att
-            _r_ans_att = int(_restant_att)
-            _r_mois_att = int((_restant_att - _r_ans_att) * 12) + 1
-            st.markdown(f"**Maturité fiscale dans : {_r_ans_att} an(s) et {_r_mois_att} mois**")
-
-            _montant_test = st.number_input(
-                "Montant du rachat envisagé (€)",
-                min_value=0.0, max_value=5_000_000.0,
-                value=30_000.0, step=1_000.0, key="attente_montant",
-            )
-
-            _val_att = float(st.session_state.get("tax_valeur_contrat", 100_000.0))
-            _net_att = float(st.session_state.get("tax_versements_nets", 80_000.0))
-            _net_total_att = float(st.session_state.get("tax_versements_nets_total", _net_att))
-            _sit_att = st.session_state.get("tax_situation_familiale", "Célibataire / veuf / divorcé")
-
-            if _montant_test > 0 and _val_att > 0:
-                _gains_now = calc_quote_part_gains(_val_att, _net_att, _montant_test)
-                _gains_after = calc_quote_part_gains(_val_att, _net_att, _montant_test)
-                _res_now = calc_imposition_rachat(
-                    _gains_now, _anciennete_att, _sit_att, _net_total_att, _montant_test
-                )
-                _res_after = calc_imposition_rachat(
-                    _gains_after, 8.1, _sit_att, _net_total_att, _montant_test
-                )
-                _eco = _res_now["total_impots"] - _res_after["total_impots"]
-
-                _ca1, _ca2 = st.columns(2)
-                with _ca1:
-                    st.markdown("**Rachat maintenant**")
-                    st.metric("Impôt + PS", to_eur(_res_now["total_impots"]))
-                    st.metric("Net perçu", to_eur(_res_now["net_percu"]))
-                with _ca2:
-                    st.markdown(f"**Rachat après maturité** ({_r_ans_att}a {_r_mois_att}m)")
-                    st.metric("Impôt + PS", to_eur(_res_after["total_impots"]))
-                    st.metric("Net perçu", to_eur(_res_after["net_percu"]))
-
-                if _eco > 0:
-                    st.success(
-                        f"💰 **En attendant {_r_ans_att} an(s) et {_r_mois_att} mois**, vous économisez "
-                        f"**{to_eur(_eco)}** d'impôt sur ce rachat de {to_eur(_montant_test)}."
-                    )
-                    # Bar chart comparatif
-                    _bar_att_df = pd.DataFrame([
-                        {"Scénario": "Rachat\nmaintenant", "Impôt (€)": _res_now["total_impots"], "Type": "Maintenant"},
-                        {"Scénario": f"Rachat après\nmaturité ({_r_ans_att}a)", "Impôt (€)": _res_after["total_impots"], "Type": "Après"},
-                    ])
-                    _bar_att = (
-                        alt.Chart(_bar_att_df)
-                        .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-                        .encode(
-                            x=alt.X("Scénario:N", sort=None, axis=alt.Axis(labelAngle=0), title=""),
-                            y=alt.Y("Impôt (€):Q", axis=alt.Axis(format=",.0f"), title="Impôt total (€)"),
-                            color=alt.Color("Type:N", scale=alt.Scale(
-                                domain=["Maintenant", "Après"], range=["#E53935", "#2E7D32"]
-                            ), legend=None),
-                            tooltip=[alt.Tooltip("Scénario:N"), alt.Tooltip("Impôt (€):Q", format=",.0f")],
-                        )
-                        .properties(height=250, title=f"Économie : {to_eur(_eco)}")
-                    )
-                    st.altair_chart(_bar_att, use_container_width=True)
-                else:
-                    st.info("L'écart fiscal est négligeable dans votre situation.")
-
-
-def _tab_transmission_v2():
-    """Transmission enrichie : calcul existant + comparaison AV vs succession + projection."""
-
-    _q1, _q2, _q3 = st.tabs([
-        "Combien mes proches recevront-ils ?",
-        "AV vs succession classique",
-        "Ai-je intérêt à verser avant 70 ans ?",
-    ])
-
-    with _q1:
+    with tab3:
         _tab_transmission()
-
-    with _q2:
-        st.markdown("#### AV vs succession classique — Comparaison en euros")
-        st.caption(
-            "Combien vos bénéficiaires recevraient-ils via l'assurance-vie "
-            "vs via une succession classique, pour le même capital ?"
-        )
-
-        _capital = float(st.session_state.get("tax_capital_deces", 200_000.0))
-        _nb = int(st.session_state.get("tax_nb_beneficiaires", 2))
-        _age = st.session_state.get("tax_age_souscripteur", 55)
-
-        if _capital <= 0 or _nb <= 0:
-            st.info("Renseignez la valeur du contrat et le nombre de bénéficiaires dans l'onglet 'Tableau de bord'.")
-            return
-
-        _part_par_benef = _capital / _nb
-
-        # ── Via l'AV (art. 990I si <70 ans) ──
-        _abat_av = 152_500.0 if _age < 70 else 30_500.0 / _nb
-        _taxable_av = max(0.0, _part_par_benef - _abat_av)
-        if _taxable_av <= 700_000:
-            _droits_av = _taxable_av * 0.20
-        else:
-            _droits_av = 700_000 * 0.20 + (_taxable_av - 700_000) * 0.3125
-        _droits_av_total = _droits_av * _nb
-        _net_av = _capital - _droits_av_total
-
-        # ── Via succession classique (barème ligne directe simplifié) ──
-        def _droits_succession_ligne_directe(taxable: float) -> float:
-            if taxable <= 0:
-                return 0.0
-            _tranches = [
-                (8_072, 0.05), (12_109, 0.10), (15_932, 0.15),
-                (552_324, 0.20), (902_838, 0.30), (1_805_677, 0.40),
-                (float("inf"), 0.45),
-            ]
-            _total = 0.0
-            _prev = 0.0
-            for _limit, _rate in _tranches:
-                _tranche = min(taxable, _limit) - _prev
-                if _tranche <= 0:
-                    break
-                _total += _tranche * _rate
-                _prev = _limit
-            return _total
-
-        _nb_enfants_succ = max(1, int(st.session_state.get("tax_nb_enfants", _nb)))
-        _abat_succ = 100_000.0
-        _part_par_enfant_succ = _capital / _nb_enfants_succ
-        _taxable_succ = max(0.0, _part_par_enfant_succ - _abat_succ)
-        _droits_succ = _droits_succession_ligne_directe(_taxable_succ)
-        _droits_succ_total = _droits_succ * _nb_enfants_succ
-        _net_succ = _capital - _droits_succ_total
-
-        _eco_av = _droits_succ_total - _droits_av_total
-
-        _col_av, _col_vs2, _col_succ = st.columns([5, 1, 5])
-        with _col_av:
-            st.markdown("**🛡️ Via l'assurance-vie**")
-            st.metric("Capital transmis", to_eur(_capital))
-            st.metric("Droits dus", to_eur(_droits_av_total))
-            st.metric("Net reçu par les bénéficiaires", to_eur(_net_av))
-            if _age < 70:
-                st.caption(f"Art. 990I — Abattement {to_eur(152_500)} par bénéficiaire")
-            else:
-                st.caption(f"Art. 757B — Abattement global {to_eur(30_500)}")
-        with _col_vs2:
-            st.markdown(
-                "<div style='text-align:center; padding-top:4rem; font-size:1.2rem; color:#aaa;'>vs</div>",
-                unsafe_allow_html=True,
-            )
-        with _col_succ:
-            st.markdown("**⚖️ Succession classique**")
-            st.metric("Capital transmis", to_eur(_capital))
-            st.metric("Droits dus", to_eur(_droits_succ_total))
-            st.metric("Net reçu par les bénéficiaires", to_eur(_net_succ))
-            st.caption(f"Abattement {to_eur(100_000)} par enfant en ligne directe")
-
-        if _eco_av > 0:
-            st.success(
-                f"✅ **L'assurance-vie économise {to_eur(_eco_av)} de droits** "
-                f"par rapport à une succession classique pour {_nb} bénéficiaire(s). "
-                f"Vos proches reçoivent {to_eur(_net_av)} au lieu de {to_eur(_net_succ)}."
-            )
-        else:
-            st.info("Dans cette configuration, la succession classique est aussi avantageuse que l'AV.")
-
-        st.caption(
-            "⚠️ Calcul simplifié en ligne directe (enfants). Les droits réels dépendent "
-            "du patrimoine global, des donations antérieures et du lien de parenté."
-        )
-
-        # Stacked bar AV vs Succession
-        _bar_trans = pd.DataFrame([
-            {"Voie": "Assurance-vie", "Composante": "Net reçu", "Montant": _net_av},
-            {"Voie": "Assurance-vie", "Composante": "Droits dus", "Montant": _droits_av_total},
-            {"Voie": "Succession classique", "Composante": "Net reçu", "Montant": _net_succ},
-            {"Voie": "Succession classique", "Composante": "Droits dus", "Montant": _droits_succ_total},
-        ])
-        _stacked_trans = (
-            alt.Chart(_bar_trans)
-            .mark_bar(cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
-            .encode(
-                x=alt.X("Voie:N", sort=None, axis=alt.Axis(labelAngle=0), title=""),
-                y=alt.Y("Montant:Q", stack="zero", axis=alt.Axis(format=",.0f"), title="€"),
-                color=alt.Color(
-                    "Composante:N",
-                    scale=alt.Scale(
-                        domain=["Net reçu", "Droits dus"],
-                        range=["#2E7D32", "#E53935"],
-                    ),
-                    legend=alt.Legend(title="", orient="bottom"),
-                ),
-                order=alt.Order("Composante:N", sort="descending"),
-                tooltip=[
-                    alt.Tooltip("Voie:N"),
-                    alt.Tooltip("Composante:N"),
-                    alt.Tooltip("Montant:Q", format=",.0f", title="€"),
-                ],
-            )
-            .properties(height=350)
-        )
-        st.altair_chart(_stacked_trans, use_container_width=True)
-
-    with _q3:
-        st.markdown("#### Ai-je intérêt à verser avant 70 ans ?")
-
-        _age = st.session_state.get("tax_age_souscripteur", 55)
-        _nb = int(st.session_state.get("tax_nb_beneficiaires", 2))
-        _val_actuelle = float(st.session_state.get("tax_valeur_contrat", 100_000.0))
-
-        if _age >= 70:
-            st.warning(
-                "Vous avez déjà dépassé 70 ans. Les nouveaux versements relèvent de "
-                "l'article 757B (abattement global de 30 500€). "
-                "Les **intérêts et plus-values** sur ces versements restent toutefois exonérés."
-            )
-            return
-
-        _ans_avant_70 = 70 - _age
-        _plafond_exo = 152_500 * _nb
-        _marge = max(0, _plafond_exo - _val_actuelle)
-
-        st.markdown(f"**Vous avez {_age} ans — encore {_ans_avant_70} ans pour verser avant 70 ans.**")
-        st.metric("Plafond d'exonération total (990I)", to_eur(_plafond_exo),
-                  delta=f"{_nb} bénéficiaire(s) × {to_eur(152_500)}")
-        st.metric("Valeur actuelle du contrat", to_eur(_val_actuelle))
-        st.metric("Marge de versement avant plafond", to_eur(_marge))
-
-        st.markdown("---")
-        st.markdown("**Projection : que devient votre versement ?**")
-
-        _xirr = st.session_state.get("_LAST_XIRR_A") or st.session_state.get("_LAST_XIRR_B")
-        _default_rdt = float(_xirr) if (_xirr and _xirr > 0) else 5.0
-
-        _p1, _p2 = st.columns(2)
-        with _p1:
-            _versement_proj = st.number_input(
-                "Versement envisagé (€)",
-                min_value=0.0, max_value=5_000_000.0,
-                value=min(_marge, 100_000.0) if _marge > 0 else 50_000.0,
-                step=5_000.0, key="proj_versement",
-            )
-        with _p2:
-            _rdt_proj = st.number_input(
-                "Rendement annuel estimé (%)",
-                min_value=-5.0, max_value=20.0,
-                value=round(_default_rdt, 1), step=0.5,
-                key="proj_rendement",
-                help="Pré-rempli avec le rendement réel du portefeuille (XIRR) si disponible.",
-            )
-
-        _horizon = _ans_avant_70
-        if _horizon > 0 and _versement_proj > 0:
-            _capital_futur = _versement_proj * (1 + _rdt_proj / 100) ** _horizon
-            _gains = _capital_futur - _versement_proj
-
-            st.markdown("---")
-            _pc1, _pc2, _pc3 = st.columns(3)
-            with _pc1:
-                st.metric("Versement aujourd'hui", to_eur(_versement_proj))
-            with _pc2:
-                st.metric(f"Valeur dans {_horizon} ans", to_eur(_capital_futur))
-            with _pc3:
-                st.metric("Plus-values générées", to_eur(_gains),
-                          delta=f"+{(_capital_futur / _versement_proj - 1) * 100:.0f}%")
-
-            if _capital_futur <= _plafond_exo:
-                st.success(
-                    f"✅ Si vous versez **{to_eur(_versement_proj)}** aujourd'hui et que le portefeuille "
-                    f"fait **{_rdt_proj:.1f}%/an**, dans **{_horizon} ans** ce sera "
-                    f"**{to_eur(_capital_futur)}** transmis à vos {_nb} bénéficiaire(s) — "
-                    f"**entièrement exonéré de droits de succession** (art. 990I)."
-                )
-            else:
-                st.info(
-                    f"Le capital projeté ({to_eur(_capital_futur)}) dépasse le plafond d'exonération "
-                    f"({to_eur(_plafond_exo)}). La part au-delà sera taxée à 20% puis 31.25%."
-                )
-
-            # Area chart projection + seuil exonération
-            _proj_years = list(range(_horizon + 1))
-            _proj_vals = [_versement_proj * (1 + _rdt_proj / 100) ** y for y in _proj_years]
-            _proj_df = pd.DataFrame({"Année": _proj_years, "Valeur (€)": _proj_vals})
-
-            _area_proj = (
-                alt.Chart(_proj_df)
-                .mark_area(opacity=0.25, color="#1B2A4A", interpolate="monotone")
-                .encode(
-                    x=alt.X("Année:Q", title="Années après versement"),
-                    y=alt.Y("Valeur (€):Q", axis=alt.Axis(format=",.0f"), title="Valeur (€)"),
-                )
-            )
-            _line_proj = (
-                alt.Chart(_proj_df)
-                .mark_line(strokeWidth=2.5, color="#1B2A4A", interpolate="monotone")
-                .encode(
-                    x="Année:Q",
-                    y="Valeur (€):Q",
-                    tooltip=[alt.Tooltip("Année:Q"), alt.Tooltip("Valeur (€):Q", format=",.0f")],
-                )
-            )
-            _seuil_df = pd.DataFrame([{"Année": 0, "Seuil": _plafond_exo}, {"Année": _horizon, "Seuil": _plafond_exo}])
-            _seuil_line = (
-                alt.Chart(_seuil_df)
-                .mark_line(strokeDash=[5, 5], strokeWidth=2, color="#E53935")
-                .encode(x="Année:Q", y=alt.Y("Seuil:Q"))
-            )
-            _seuil_lbl_df = pd.DataFrame([{
-                "Année": _horizon * 0.5, "Seuil": _plafond_exo,
-                "text": f"Seuil exonération : {to_eur(_plafond_exo)}",
-            }])
-            _seuil_label = (
-                alt.Chart(_seuil_lbl_df)
-                .mark_text(dy=-12, fontSize=11, color="#E53935", fontWeight="bold")
-                .encode(x="Année:Q", y="Seuil:Q", text="text:N")
-            )
-            st.altair_chart(
-                (_area_proj + _line_proj + _seuil_line + _seuil_label).properties(height=320),
-                use_container_width=True,
-            )
-
-
-def _tab_avantages_av():
-    """Comparaison AV vs CTO + tableau AV vs PER."""
-
-    _q1, _q2 = st.tabs([
-        "AV vs Compte-titres (CTO)",
-        "AV vs PER",
-    ])
-
-    with _q1:
-        st.markdown("#### L'effet capitalisation : AV vs CTO")
-        st.caption(
-            "Même capital, même performance. Mais en AV la capitalisation se fait "
-            "sans frottement fiscal (taxé uniquement à la sortie). "
-            "En CTO, chaque arbitrage est taxé à 30%."
-        )
-
-        _xirr = st.session_state.get("_LAST_XIRR_A") or st.session_state.get("_LAST_XIRR_B")
-        _default_rdt = float(_xirr) if (_xirr and _xirr > 0) else 6.0
-
-        _ac1, _ac2 = st.columns(2)
-        with _ac1:
-            _capital_init = st.number_input(
-                "Capital initial (€)", min_value=1_000.0, max_value=5_000_000.0,
-                value=100_000.0, step=5_000.0, key="avcto_capital",
-            )
-            _perf_brute = st.number_input(
-                "Performance brute annuelle (%)",
-                min_value=0.0, max_value=20.0,
-                value=round(_default_rdt, 1), step=0.5, key="avcto_perf",
-                help="Pré-rempli avec le rendement réel du portefeuille si disponible.",
-            )
-        with _ac2:
-            _horizon_av = st.slider(
-                "Horizon (années)", min_value=5, max_value=40,
-                value=20, key="avcto_horizon",
-            )
-            _freq_arb = st.selectbox(
-                "Fréquence d'arbitrage (CTO)",
-                ["Annuel", "Tous les 2 ans", "Tous les 5 ans"],
-                index=0, key="avcto_freq",
-                help="En CTO, chaque arbitrage déclenche la flat tax sur les PV réalisées.",
-            )
-        _freq_years = {"Annuel": 1, "Tous les 2 ans": 2, "Tous les 5 ans": 5}[_freq_arb]
-
-        # ── Calcul AV : capitalisation sans frottement ──
-        _val_av = _capital_init * (1 + _perf_brute / 100) ** _horizon_av
-        _gains_av = _val_av - _capital_init
-        _abat_av_sortie = 4_600.0
-        _gains_taxables_av = max(0.0, _gains_av - _abat_av_sortie)
-        _tax_av = _gains_taxables_av * (0.075 + 0.172)
-        _net_av = _val_av - _tax_av
-
-        # ── Calcul CTO : frottement à chaque arbitrage ──
-        _series_cto = [_capital_init]
-        _cto_val = _capital_init
-        _cto_base = _capital_init
-        for _y in range(1, _horizon_av + 1):
-            _cto_val *= (1 + _perf_brute / 100)
-            if _y % _freq_years == 0 and _y < _horizon_av:
-                _pv = _cto_val - _cto_base
-                if _pv > 0:
-                    _cto_val -= _pv * 0.30
-                    _cto_base = _cto_val
-            _series_cto.append(_cto_val)
-        _gains_cto = _cto_val - _capital_init
-        _tax_cto_final = max(0.0, _gains_cto) * 0.30
-        _net_cto = _cto_val - _tax_cto_final
-
-        # ── Graphique ──
-        _years = list(range(_horizon_av + 1))
-        _series_av_list = [_capital_init * (1 + _perf_brute / 100) ** y for y in _years]
-        _chart_df = pd.DataFrame({
-            "Année": _years * 2,
-            "Valeur (€)": _series_av_list + _series_cto,
-            "Enveloppe": (["Assurance-vie (sans frottement)"] * len(_years)
-                          + ["Compte-titres (flat tax 30%)"] * len(_years)),
-        })
-
-        # Zone d'écart colorée entre AV et CTO
-        _ecart_df = pd.DataFrame({
-            "Année": _years,
-            "AV": _series_av_list,
-            "CTO": _series_cto,
-        })
-        _area_ecart = (
-            alt.Chart(_ecart_df.melt("Année", value_vars=["AV", "CTO"], var_name="X", value_name="Y")
-               .pivot_table(index="Année", columns="X", values="Y").reset_index())
-            .mark_area(opacity=0.12, color="#2E7D32")
-            .encode(
-                x=alt.X("Année:Q"),
-                y=alt.Y("CTO:Q"),
-                y2="AV:Q",
-            )
-        )
-
-        _chart = (
-            alt.Chart(_chart_df)
-            .mark_line(strokeWidth=2.5)
-            .encode(
-                x=alt.X("Année:Q", title="Années"),
-                y=alt.Y("Valeur (€):Q", axis=alt.Axis(format=",.0f"), title="Valeur (€)"),
-                color=alt.Color(
-                    "Enveloppe:N",
-                    scale=alt.Scale(
-                        domain=["Assurance-vie (sans frottement)", "Compte-titres (flat tax 30%)"],
-                        range=["#1B2A4A", "#CC2200"],
-                    ),
-                    legend=alt.Legend(title="", orient="bottom"),
-                ),
-                tooltip=[
-                    alt.Tooltip("Année:Q"),
-                    alt.Tooltip("Enveloppe:N"),
-                    alt.Tooltip("Valeur (€):Q", format=",.0f"),
-                ],
-            )
-            .properties(height=400)
-        )
-        st.altair_chart((_area_ecart + _chart).properties(height=400), use_container_width=True)
-
-        _ecart = _net_av - _net_cto
-        _ecart_pct = (_ecart / _net_cto * 100) if _net_cto > 0 else 0
-        _mc1, _mc2, _mc3 = st.columns(3)
-        with _mc1:
-            st.metric("Net après impôt — AV", to_eur(_net_av))
-        with _mc2:
-            st.metric("Net après impôt — CTO", to_eur(_net_cto))
-        with _mc3:
-            st.metric("Avantage AV", to_eur(_ecart), delta=f"+{_ecart_pct:.0f}%")
-
-        if _ecart > 0:
-            st.success(
-                f"✅ Sur **{_horizon_av} ans**, l'assurance-vie génère **{to_eur(_ecart)} de plus** "
-                f"que le compte-titres, à performance identique. C'est l'effet de la capitalisation "
-                f"sans frottement fiscal."
-            )
-
-    with _q2:
-        st.markdown("#### AV vs PER — Tableau comparatif")
-        _comp_data = pd.DataFrame({
-            "Critère": [
-                "Disponibilité du capital",
-                "Fiscalité à l'entrée",
-                "Fiscalité à la sortie (capital)",
-                "Fiscalité à la sortie (rente)",
-                "Transmission",
-                "Plafond de versement",
-                "Cas de déblocage anticipé",
-            ],
-            "Assurance-vie": [
-                "✅ Totale, à tout moment",
-                "Aucune déduction",
-                "PFL 7,5% + PS après 8 ans (avec abattement)",
-                "Fraction imposable selon l'âge (30-70%)",
-                "✅ Hors succession (152 500€/bénéficiaire)",
-                "Aucun plafond",
-                "Non applicable (capital toujours disponible)",
-            ],
-            "PER": [
-                "❌ Bloqué jusqu'à la retraite",
-                "✅ Déductible du revenu imposable",
-                "IR + PS sur le capital (si déduit à l'entrée)",
-                "IR + PS sur la totalité",
-                "❌ Succession classique (sauf exceptions)",
-                "Plafonné (10% revenus N-1)",
-                "Achat résidence principale, invalidité, décès conjoint...",
-            ],
-        })
-        st.dataframe(_comp_data, hide_index=True, use_container_width=True)
-        st.caption(
-            "L'AV privilégie la **disponibilité et la transmission**. "
-            "Le PER privilégie la **déduction fiscale à l'entrée** (intéressant pour les TMI élevées)."
-        )
+    with tab4:
+        _tab_exoneration()
 
 
 def run_perfect_portfolio():
     render_portfolio_builder()
 
 
+# ============================================================
+# MODULE FICHE FONDS — Morningstar via mstarpy
+# ============================================================
+
+_FS_SECTOR_LABELS: Dict[str, str] = {
+    "basicMaterials":        "Matériaux de base",
+    "consumerCyclical":      "Conso. cyclique",
+    "financialServices":     "Services financiers",
+    "realEstate":            "Immobilier",
+    "communicationServices": "Communication",
+    "energy":                "Énergie",
+    "industrials":           "Industrie",
+    "technology":            "Technologie",
+    "consumerDefensive":     "Conso. défensive",
+    "healthcare":            "Santé",
+    "utilities":             "Services publics",
+}
+
+_FS_FI_LABELS: Dict[str, str] = {
+    "government":         "Gouvernemental",
+    "municipal":          "Municipal",
+    "corporate":          "Corporate",
+    "securitized":        "Titrisé",
+    "cashAndEquivalents": "Cash & équivalents",
+    "derivative":         "Dérivés",
+}
+
+_FS_TRAILING_PERIODS: Dict[str, str] = {
+    "M1":  "1 mois",
+    "M3":  "3 mois",
+    "M6":  "6 mois",
+    "M12": "1 an",
+    "M36": "3 ans",
+    "M60": "5 ans",
+    "M120": "10 ans",
+}
+
+
+@st.cache_data(ttl=604800, show_spinner="Chargement des données Morningstar...")
+def _load_fund_data(isin: str) -> Optional[Dict[str, Any]]:
+    """Charge les données d'un fonds via mstarpy — TTL 7 jours."""
+    if not MSTARPY_AVAILABLE:
+        return None
+    try:
+        fund = mstarpy.Funds(term=isin, pageSize=1)
+        if not fund.isin:
+            return None
+
+        result: Dict[str, Any] = {
+            "name":            getattr(fund, "name", isin),
+            "isin":            fund.isin,
+            "holdings":        None,
+            "sector_equity":   None,
+            "sector_fi":       None,
+            "trailing_returns": None,
+            "risk":            None,
+            "esg":             None,
+        }
+
+        # Holdings
+        try:
+            df = fund.holdings(holdingType="all")
+            if df is not None:
+                if not isinstance(df, pd.DataFrame):
+                    df = pd.DataFrame(df)
+                if not df.empty:
+                    wanted = ["securityName", "weighting", "country", "sector",
+                              "holdingType", "isin", "currency", "morningstarRating"]
+                    present = [c for c in wanted if c in df.columns]
+                    result["holdings"] = df[present].head(15).to_dict("records")
+        except Exception:
+            pass
+
+        # Secteurs
+        try:
+            sectors = fund.sector()
+            if isinstance(sectors, dict):
+                eq_raw = (sectors.get("EQUITY") or {}).get("fundPortfolio") or {}
+                fi_raw = (sectors.get("FIXEDINCOME") or {}).get("fundPortfolio") or {}
+                result["sector_equity"] = {
+                    k: float(v) for k, v in eq_raw.items()
+                    if k != "portfolioDate" and isinstance(v, (int, float)) and float(v) > 0
+                }
+                result["sector_fi"] = {
+                    k: float(v) for k, v in fi_raw.items()
+                    if k != "portfolioDate" and isinstance(v, (int, float)) and float(v) > 0
+                }
+        except Exception:
+            pass
+
+        # Performances glissantes
+        try:
+            result["trailing_returns"] = fund.trailingReturn()
+        except Exception:
+            pass
+
+        # Risque / volatilité
+        try:
+            result["risk"] = fund.riskVolatility()
+        except Exception:
+            pass
+
+        # ESG
+        try:
+            result["esg"] = fund.esgRisk()
+        except Exception:
+            pass
+
+        return result
+    except Exception:
+        return None
+
+
+def _fs_extract_trailing(raw: Any) -> Optional[pd.DataFrame]:
+    """Extrait les performances glissantes depuis la structure réelle de trailingReturn()."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        col_defs = raw.get("columnDefs") or []
+        nav      = raw.get("totalReturnNAV") or []
+        cat      = raw.get("totalReturnCategory") or []
+        idx      = raw.get("totalReturnIndex") or []
+
+        PERIODS = {
+            "1Month":     "1 mois",
+            "3Month":     "3 mois",
+            "YearToDate": "Depuis le 1er janv.",
+            "1Year":      "1 an",
+            "3Year":      "3 ans",
+            "5Year":      "5 ans",
+            "10Year":     "10 ans",
+        }
+
+        def _val(lst: Any, i: int) -> Optional[float]:
+            try:
+                v = lst[i]
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+
+        rows = []
+        for period_key, period_label in PERIODS.items():
+            if period_key not in col_defs:
+                continue
+            i  = col_defs.index(period_key)
+            fv = _val(nav, i)
+            cv = _val(cat, i)
+            iv = _val(idx, i)
+            if fv is not None:
+                rows.append({
+                    "Période":       period_label,
+                    "Fonds (%)":     fv,
+                    "Catégorie (%)": cv,
+                    "Indice (%)":    iv,
+                })
+        return pd.DataFrame(rows) if rows else None
+    except Exception:
+        return None
+
+
+def _fs_extract_risk(raw: Any) -> Dict[str, Optional[float]]:
+    """Extrait vol 3 ans, max drawdown, sharpe depuis la structure réelle de riskVolatility()."""
+    out: Dict[str, Optional[float]] = {"vol": None, "mdd": None, "sharpe": None}
+    if not isinstance(raw, dict):
+        return out
+    try:
+        frv = raw.get("fundRiskVolatility") or {}
+        for period in ("for3Year", "for5Year", "for1Year"):
+            period_data = frv.get(period) or {}
+            if not isinstance(period_data, dict):
+                continue
+            vol    = period_data.get("standardDeviation")
+            sharpe = period_data.get("sharpeRatio")
+            if vol is not None or sharpe is not None:
+                try:
+                    out["vol"]    = float(vol)    if vol    is not None else None
+                    out["sharpe"] = float(sharpe) if sharpe is not None else None
+                except (TypeError, ValueError):
+                    pass
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _fs_extract_esg(raw: Any) -> Dict[str, Any]:
+    """Extrait score, catégorie calculée, date depuis la structure réelle de esgRisk()."""
+    out: Dict[str, Any] = {"score": None, "category": None, "date": None}
+    if not isinstance(raw, dict):
+        return out
+    try:
+        score = raw.get("fundSustainabilityScore")
+        if score is not None:
+            try:
+                score = float(score)
+                out["score"] = score
+                if score <= 10:
+                    out["category"] = "Négligeable"
+                elif score <= 20:
+                    out["category"] = "Faible"
+                elif score <= 30:
+                    out["category"] = "Moyen"
+                elif score <= 40:
+                    out["category"] = "Élevé"
+                else:
+                    out["category"] = "Sévère"
+            except (TypeError, ValueError):
+                pass
+        date_raw = (
+            raw.get("portfolioDateSustainabilityRating")
+            or raw.get("portfolioDate")
+            or raw.get("categoryRankDate")
+        )
+        if date_raw:
+            try:
+                out["date"] = pd.Timestamp(date_raw).strftime("%d/%m/%Y")
+            except Exception:
+                out["date"] = str(date_raw)[:10]
+    except Exception:
+        pass
+    return out
+
+
+def _fs_bar_chart(labels: List[str], values: List[float], color: str, title: str) -> None:
+    """Graphique barres horizontal — Plotly si disponible, Altair sinon."""
+    # Filtrer valeurs négligeables
+    pairs = [(l, v) for l, v in zip(labels, values) if v >= 0.5]
+    if not pairs:
+        return
+    pairs_sorted = sorted(pairs, key=lambda x: x[1], reverse=True)
+    labs_s = [p[0] for p in pairs_sorted]
+    vals_s = [p[1] for p in pairs_sorted]
+    max_val = max(vals_s) if vals_s else 1.0
+    # Espace pour les labels : 50% si valeurs < 15%, sinon 30%
+    x_max = max_val * (1.5 if max_val < 15.0 else 1.3)
+    text_pos = "inside" if max_val >= 15.0 else "outside"
+
+    if PLOTLY_AVAILABLE and go is not None:
+        fig = go.Figure(go.Bar(
+            x=vals_s,
+            y=labs_s,
+            orientation="h",
+            marker_color=color,
+            marker_line_width=0,
+            text=[f"{v:.1f}%" for v in vals_s],
+            textposition=text_pos,
+            textfont=dict(size=11),
+            hovertemplate="%{y}: %{x:.1f}%<extra></extra>",
+        ))
+        fig.update_layout(
+            height=max(220, 32 * len(labs_s) + 60),
+            margin=dict(l=10, r=60, t=10, b=30),
+            xaxis=dict(
+                range=[0, x_max],
+                ticksuffix="%",
+                showgrid=True,
+                gridcolor="rgba(200,200,200,0.3)",
+                zeroline=False,
+                title=None,
+            ),
+            yaxis=dict(
+                autorange="reversed",
+                tickfont=dict(size=11),
+            ),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Fallback Altair inchangé
+        df_chart = pd.DataFrame({"Catégorie": labs_s, "Valeur (%)": vals_s})
+        chart = (
+            alt.Chart(df_chart)
+            .mark_bar(color=color)
+            .encode(
+                x=alt.X(
+                    "Valeur (%):Q",
+                    title=None,
+                    scale=alt.Scale(domain=[0, x_max]),
+                ),
+                y=alt.Y("Catégorie:N", sort="-x"),
+                tooltip=[
+                    "Catégorie:N",
+                    alt.Tooltip("Valeur (%):Q", format=".1f"),
+                ],
+            )
+            .properties(height=max(200, 28 * len(labs_s) + 50))
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+
+def _render_fund_sheet_content(data: Dict[str, Any]) -> None:
+    """Affiche le contenu de la fiche fonds à partir du dict chargé."""
+    st.header(data.get("name", "—"))
+    st.caption(f"ISIN : {data.get('isin', '—')}")
+    st.markdown("---")
+
+    # ── Section 1 : Holdings ─────────────────────────────────
+    try:
+        holdings = data.get("holdings")
+        if holdings:
+            st.subheader("🏦 Top 15 positions")
+            df_h = pd.DataFrame(holdings)
+            rename_map = {
+                "securityName":    "Titre",
+                "weighting":       "Poids (%)",
+                "country":         "Pays",
+                "sector":          "Secteur",
+                "holdingType":     "Type",
+                "currency":        "Devise",
+                "morningstarRating": "Note MS",
+            }
+            df_h = df_h.rename(columns={k: v for k, v in rename_map.items() if k in df_h.columns})
+            if "Poids (%)" in df_h.columns:
+                df_h["Poids (%)"] = pd.to_numeric(df_h["Poids (%)"], errors="coerce").round(2)
+
+            type_col = "Type"
+            df_eq = df_h[df_h[type_col].str.lower().str.contains("equity", na=False)] if type_col in df_h.columns else pd.DataFrame()
+            df_bond = df_h[df_h[type_col].str.lower().str.contains("bond|fi|fixed", na=False)] if type_col in df_h.columns else pd.DataFrame()
+            df_other = df_h[~df_h.index.isin(df_eq.index.tolist() + df_bond.index.tolist())] if not df_eq.empty or not df_bond.empty else df_h
+
+            with st.expander("📈 Actions", expanded=True):
+                if not df_eq.empty:
+                    st.dataframe(df_eq.drop(columns=[type_col], errors="ignore"), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Aucune position actions dans le top 15.")
+            with st.expander("📉 Obligations", expanded=True):
+                if not df_bond.empty:
+                    st.dataframe(df_bond.drop(columns=[type_col], errors="ignore"), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Aucune position obligataire dans le top 15.")
+            if not df_other.empty and type_col in df_h.columns:
+                with st.expander("🔹 Autres", expanded=False):
+                    st.dataframe(df_other, use_container_width=True, hide_index=True)
+        else:
+            st.subheader("🏦 Top 15 positions")
+            st.info("Holdings non disponibles pour ce fonds.")
+    except Exception:
+        st.subheader("🏦 Top 15 positions")
+        st.info("Holdings non disponibles pour ce fonds.")
+
+    st.markdown("---")
+
+    # ── Section 2 : Secteurs ─────────────────────────────────
+    col_eq, col_fi = st.columns(2)
+    with col_eq:
+        try:
+            sec_eq = data.get("sector_equity") or {}
+            if sec_eq:
+                st.subheader("📊 Secteurs (Actions)")
+                labels = [_FS_SECTOR_LABELS.get(k, k) for k in sec_eq]
+                values = list(sec_eq.values())
+                _fs_bar_chart(labels, values, "#1f77b4", "Secteurs actions")
+            else:
+                st.subheader("📊 Secteurs (Actions)")
+                st.info("Données sectorielles actions non disponibles.")
+        except Exception:
+            st.info("Données sectorielles actions non disponibles.")
+
+    with col_fi:
+        try:
+            sec_fi = data.get("sector_fi") or {}
+            if sec_fi:
+                st.subheader("📊 Obligations")
+                labels = [_FS_FI_LABELS.get(k, k) for k in sec_fi]
+                values = list(sec_fi.values())
+                _fs_bar_chart(labels, values, "#ff7f0e", "Répartition obligataire")
+            else:
+                st.subheader("📊 Obligations")
+                st.info("Données de répartition obligataire non disponibles.")
+        except Exception:
+            st.info("Données de répartition obligataire non disponibles.")
+
+    st.markdown("---")
+
+    # ── Section 3 : Performances glissantes ──────────────────
+    try:
+        st.subheader("📈 Performances glissantes")
+        df_perf = _fs_extract_trailing(data.get("trailing_returns"))
+        if df_perf is not None and not df_perf.empty:
+            num_cols = [c for c in df_perf.columns if c != "Période"]
+            col_cfg: Dict[str, Any] = {}
+            for c in num_cols:
+                col_cfg[c] = st.column_config.NumberColumn(c, format="%.2f%%")
+            st.dataframe(
+                df_perf,
+                use_container_width=True,
+                hide_index=True,
+                column_config=col_cfg,
+            )
+        else:
+            st.info("Performances non disponibles.")
+    except Exception:
+        st.info("Performances non disponibles.")
+
+    st.markdown("---")
+
+    # ── Section 4 : Risque ───────────────────────────────────
+    try:
+        st.subheader("⚠️ Indicateurs de risque")
+        risk = _fs_extract_risk(data.get("risk"))
+        if any(v is not None for v in risk.values()):
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric(
+                "Volatilité 3 ans (ann.)",
+                f"{risk['vol']:.1f}%" if risk["vol"] is not None else "—",
+            )
+            rc2.metric(
+                "Max Drawdown",
+                f"{risk['mdd']:.1f}%" if risk["mdd"] is not None else "—",
+            )
+            rc3.metric(
+                "Sharpe 3 ans",
+                f"{risk['sharpe']:.2f}" if risk["sharpe"] is not None else "—",
+            )
+        else:
+            st.info("Données de risque non disponibles.")
+    except Exception:
+        st.info("Données de risque non disponibles.")
+
+    st.markdown("---")
+
+    # ── Section 5 : ESG ──────────────────────────────────────
+    try:
+        st.subheader("🌱 Score ESG (Morningstar Sustainalytics)")
+        esg = _fs_extract_esg(data.get("esg"))
+        if esg["score"] is not None or esg["category"] is not None:
+            ec1, ec2 = st.columns([1, 2])
+            with ec1:
+                st.metric("Score ESG", f"{esg['score']:.1f}" if esg["score"] is not None else "—")
+            with ec2:
+                cat_str  = esg["category"] or "—"
+                date_str = esg["date"] or "—"
+                st.caption(f"Catégorie : **{cat_str}** — Mis à jour : {date_str}")
+        else:
+            st.info("Données ESG non disponibles.")
+    except Exception:
+        st.info("Données ESG non disponibles.")
+
+
+def render_fund_sheet() -> None:
+    """Mode Fiche fonds — chargement Morningstar via mstarpy."""
+    if not MSTARPY_AVAILABLE:
+        st.error(
+            "La librairie mstarpy n'est pas installée. "
+            "Ajoutez 'mstarpy' dans requirements.txt."
+        )
+        return
+
+    st.title("📊 Fiche fonds")
+    st.info(
+        "ℹ️ Données issues de Morningstar (données publiques). "
+        "Holdings mis à jour mensuellement. À titre indicatif."
+    )
+
+    # Saisie ISIN
+    isin_raw = st.text_input(
+        "ISIN du fonds",
+        placeholder="Ex : FR0010135103",
+        max_chars=12,
+        key="fs_isin",
+    ).strip().upper()
+
+    # Validation format : 12 chars, 2 premières lettres, reste alphanumérique
+    valid_isin = (
+        len(isin_raw) == 12
+        and isin_raw[:2].isalpha()
+        and isin_raw[2:].isalnum()
+    )
+
+    # Détecter changement d'ISIN → réinitialiser le trigger
+    last_isin = st.session_state.get("fs_last_isin", "")
+    if isin_raw != last_isin:
+        st.session_state["fs_triggered"] = False
+
+    if isin_raw and not valid_isin:
+        st.warning("Format ISIN invalide. Un ISIN fait 12 caractères : 2 lettres (pays) + 10 alphanumériques. Ex : FR0010135103")
+        return
+
+    col_btn, _ = st.columns([1, 4])
+    with col_btn:
+        if st.button("🔍 Rechercher", key="fs_search_btn", type="primary"):
+            st.session_state["fs_triggered"] = True
+            st.session_state["fs_last_isin"] = isin_raw
+
+    if not st.session_state.get("fs_triggered"):
+        return
+
+    if not isin_raw:
+        st.warning("Saisissez un ISIN avant de lancer la recherche.")
+        return
+
+    data = _load_fund_data(isin_raw)
+    if data is None:
+        st.error(
+            f"Fonds non trouvé pour l'ISIN **{isin_raw}**. "
+            "Vérifiez l'ISIN ou essayez une autre part du même fonds."
+        )
+        return
+
+    _render_fund_sheet_content(data)
+
+
 def render_mode_router():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    with st.sidebar:
-        _sidebar_title = st.session_state.get("NOM_CABINET", "").strip()
-        st.markdown(f"## {_sidebar_title if _sidebar_title else APP_TITLE}")
-        st.caption(APP_SUBTITLE)
-        st.divider()
-        mode = st.radio(
-            "Navigation",
-            [
-                "📊 Comparateur",
-                "🏗️ Construction optimisée",
-                "🧾 Fiscalité & Avantages AV",
-            ],
-            label_visibility="collapsed",
-        )
-    if mode == "📊 Comparateur":
+    mode = st.radio(
+        "Mode",
+        [
+            "Comparer des portefeuilles",
+            "Construction de portefeuille optimisé",
+            "Fiscalité assurance-vie",
+            "📊 Fiche fonds",
+        ],
+        horizontal=True,
+    )
+    if mode == "Comparer des portefeuilles":
         run_comparator()
-    elif mode == "🏗️ Construction optimisée":
+    elif mode == "Construction de portefeuille optimisé":
         run_perfect_portfolio()
+    elif mode == "Fiscalité assurance-vie":
+        render_tax_module()
     else:
-        render_tax_module()  # "🧾 Fiscalité & Avantages AV"
+        render_fund_sheet()
 
 
 def _render_with_crash_shield():
